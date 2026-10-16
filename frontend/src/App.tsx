@@ -523,18 +523,31 @@ export function App() {
   async function handleGenerateCustomMusic() {
     if (!customMusicPrompt.trim()) return;
     setIsGeneratingMusic(true);
-    setStatusMessage(`Generating custom soundtrack for "${customMusicPrompt}"...`);
+    const selectedPhotoCount = matchedMedia.filter(
+      (m) => selectedMediaIds.has(m.id) && m.media_type === 'photo'
+    ).length;
+    const photoMomentCount = Math.max(2, selectedPhotoCount || 3);
+    setStatusMessage(
+      `Generating custom Gemini Lyria soundtrack for "${customMusicPrompt}" with ${photoMomentCount} photo-showcase phrases...`
+    );
     try {
       const cueMap = await runTask(
-        'Generating custom music',
-        { stage: `Composing “${customMusicPrompt.slice(0, 40)}”`, service: 'Music generator' },
+        'Generating custom music via Gemini Lyria',
+        {
+          stage: `Composing “${customMusicPrompt.slice(0, 36)}” (${photoMomentCount} photo moments)`,
+          service: 'Gemini 2.5 Flash + Lyria 3',
+        },
         (taskId) =>
           fetchJson<AudioCueMap>(
             '/api/music/generate',
             {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ prompt: customMusicPrompt, target_duration_sec: targetDurationSec }),
+              body: JSON.stringify({
+                prompt: customMusicPrompt,
+                target_duration_sec: targetDurationSec,
+                photo_count: photoMomentCount,
+              }),
             },
             taskId
           ),
@@ -1688,14 +1701,14 @@ export function App() {
 
                     <div>
                       <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                        Generate Custom AI Music Track
+                        Generate Custom AI Music Track (Gemini Lyria)
                       </label>
                       <div className="flex gap-2">
                         <input
                           type="text"
                           value={customMusicPrompt}
                           onChange={(e) => setCustomMusicPrompt(e.target.value)}
-                          placeholder="e.g., Lyrical piano building to drop"
+                          placeholder="e.g., Classical ballet waltz or lyrical piano"
                           className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900"
                         />
                         <button
@@ -1706,6 +1719,19 @@ export function App() {
                           {isGeneratingMusic ? '...' : 'Generate'}
                         </button>
                       </div>
+                      <p className="text-[11px] text-slate-500 mt-1">
+                        ✨ Automatically hints Gemini Lyria to weave{' '}
+                        <span className="font-semibold text-slate-700">
+                          {Math.max(
+                            2,
+                            matchedMedia.filter(
+                              (m) => selectedMediaIds.has(m.id) && m.media_type === 'photo'
+                            ).length || 3
+                          )}{' '}
+                          natural legato/rubato phrases
+                        </span>{' '}
+                        matching your selected photos.
+                      </p>
                     </div>
                   </div>
                 </div>

@@ -206,20 +206,32 @@ BUILT_IN_TRACK_SPECS: List[Dict[str, Any]] = [
 
 
 def _enrich_music_prompt_with_gemini(
-    user_prompt: str, target_duration_sec: float, preferred_bpm: Optional[float]
+    user_prompt: str,
+    target_duration_sec: float,
+    preferred_bpm: Optional[float],
+    photo_count: Optional[int] = None,
 ) -> Tuple[str, str, float]:
     """
     Uses Gemini (`gemini-2.5-flash`) to transform a user prompt into a rich,
-    genre-specific instrumental music prompt for Gemini Lyria (`lyria-3-clip-preview`).
+    genre-specific instrumental music prompt for Gemini Lyria (`lyria-3-clip-preview`),
+    weaving N natural legato/rubato photo-showcase phrases into continuous music.
     """
     lower = user_prompt.lower()
     base_spec = _infer_spec_from_prompt(lower)
     default_bpm = float(preferred_bpm) if preferred_bpm else float(base_spec["bpm"])
     default_genre = str(base_spec["genre"])
+    n_photos = max(1, min(6, int(photo_count))) if (photo_count is not None and photo_count > 0) else 3
+
+    photo_phrase_hint = (
+        f"Naturally weave {n_photos} expressive legato/rubato melodic showcase phrases (~2 seconds each) "
+        f"across the continuous musical arrangement where heavy percussion softens gently and warm sustained "
+        f"melody/harmony floats forward (ideal for showcasing {n_photos} still dance photos), before seamlessly "
+        f"rejoining the rhythmic groove—never use dead silence or abrupt mutes."
+    )
 
     if not settings.gemini_api_key:
         return (
-            f"Continuous, natural instrumental dance soundtrack: {user_prompt}. {int(default_bpm)} BPM, expressive flowing melody and clear measure downbeats. Instrumental only, no vocals.",
+            f"Continuous, natural instrumental dance soundtrack: {user_prompt}. {int(default_bpm)} BPM, expressive flowing melody and clear measure downbeats. {photo_phrase_hint} Instrumental only, no vocals.",
             default_genre,
             default_bpm,
         )
@@ -230,15 +242,23 @@ def _enrich_music_prompt_with_gemini(
 
         client = genai.Client(api_key=settings.gemini_api_key)
         sys_instruction = (
-            "You are an expert dance music director and composer. "
-            "Given a user's music request for a dance video reel, output a JSON object with keys:\n"
-            '- "lyria_prompt": A vivid 2-3 sentence instrumental music generation prompt specifying exact acoustic/electronic instruments, key/mood, continuous natural flowing musicality (no abrupt stops or mutes), and clear rhythmic pulse for dance. CRITICAL RULE: Never mention any real artist, composer, band, or copyrighted song names (translate any artist/song reference into pure musical style, era, and instrumentation descriptions). Always end with "Continuous studio instrumental only, no vocals."\n'
+            "You are an expert dance music director and film choreographer composer. "
+            "Given a user's music request for a dance video reel that mixes dance video clips with N still photos, output a JSON object with keys:\n"
+            '- "lyria_prompt": A vivid 3-sentence instrumental music generation prompt specifying exact acoustic/electronic instruments, key/mood, and a natural continuous musical flow at the target BPM. '
+            f"Crucially, instruct the music model to organically weave {n_photos} distinct, expressive ~2-second legato/rubato melodic showcase moments "
+            "(where heavy drum transients soften into a floating violin/cello/harp/piano/Rhodes/synth-pad harmonic swell before returning to the crisp 8-count dance groove) "
+            f"so the video editor has {n_photos} natural musical spotlights for still photos—WITHOUT any dead silence, drop-outs, or abrupt mutes. "
+            'CRITICAL RULE: Never mention any real artist, composer, band, or copyrighted song names (translate any artist/song reference into pure musical style, era, and instrumentation descriptions). Always end with "Continuous studio instrumental only, no vocals."\n'
             '- "genre": A short snake_case genre tag (e.g. "classical_ballet_adagio", "classical_ballet_waltz", "classical_ballet_variation", "lyrical_piano_strings", "neoclassical_strings", "contemporary_cinematic", "jazz_broadway_groove", "studio_hiphop_beat", "latin_ballroom", "competition_edm_pop").\n'
             '- "bpm": Ideal numeric tempo in BPM between 76 and 145 matching the requested style.'
         )
         resp = client.models.generate_content(
             model=settings.gemini_model,
-            contents=f"User music request: {user_prompt}\nPreferred BPM: {preferred_bpm or 'auto'}",
+            contents=(
+                f"User music request: {user_prompt}\n"
+                f"Preferred BPM: {preferred_bpm or 'auto'}\n"
+                f"Number of still photos to showcase in the reel (N): {n_photos}"
+            ),
             config=types.GenerateContentConfig(
                 system_instruction=sys_instruction,
                 response_mime_type="application/json",
@@ -256,7 +276,7 @@ def _enrich_music_prompt_with_gemini(
         pass
 
     return (
-        f"Continuous, natural instrumental dance music for: {user_prompt}. Expressive flowing melody, authentic instrumentation, {int(default_bpm)} BPM. Instrumental only, no vocals.",
+        f"Continuous, natural instrumental dance music for: {user_prompt}. Expressive flowing melody, authentic instrumentation, {int(default_bpm)} BPM. {photo_phrase_hint} Instrumental only, no vocals.",
         default_genre,
         default_bpm,
     )
@@ -602,20 +622,28 @@ def generate_custom_music_track(
     prompt: str,
     target_duration_sec: float = 18.0,
     preferred_bpm: Optional[float] = None,
+    photo_count: Optional[int] = None,
 ) -> AudioCueMap:
     """
-    Generates a custom dance soundtrack tailored to the user's prompt via Gemini (`gemini-2.5-flash` + `lyria-3-clip-preview`).
+    Generates a custom dance soundtrack tailored to the user's prompt and photo count (N)
+    via Gemini (`gemini-2.5-flash` + `lyria-3-clip-preview`).
     """
     prompt_clean = (prompt or "Inspiring contemporary competition dance").strip()
-    digest = hashlib.md5(f"{prompt_clean}_{target_duration_sec}_{preferred_bpm}_{MUSIC_ENGINE_VERSION}".encode("utf-8")).hexdigest()[:8]
+    n_photos = max(2, min(6, int(photo_count))) if (photo_count is not None and photo_count > 0) else 3
+    digest = hashlib.md5(f"{prompt_clean}_{target_duration_sec}_{preferred_bpm}_{n_photos}_{MUSIC_ENGINE_VERSION}".encode("utf-8")).hexdigest()[:8]
     track_id = f"ai_gen_{digest}"
     wav_path = MUSIC_DIR / f"{track_id}.wav"
 
-    progress.update(5, f"Crafting musical arrangement for “{prompt_clean[:40]}”", service="Gemini 2.5 Flash")
+    progress.update(
+        5,
+        f"Composing arrangement with {n_photos} photo-showcase phrases for “{prompt_clean[:36]}”",
+        service="Gemini 2.5 Flash",
+    )
     lyria_prompt, genre_slug, target_bpm = _enrich_music_prompt_with_gemini(
         user_prompt=prompt_clean,
         target_duration_sec=target_duration_sec,
         preferred_bpm=preferred_bpm,
+        photo_count=n_photos,
     )
 
     dur = max(14.0, min(28.0, float(target_duration_sec) + 3.0))
@@ -627,7 +655,11 @@ def generate_custom_music_track(
     sust_win = (s_start, round(s_start + 2.1, 1))
 
     if not wav_path.exists():
-        progress.update(15, f"Generating studio audio via Gemini Lyria ({int(target_bpm)} BPM)", service="Gemini Lyria 3")
+        progress.update(
+            15,
+            f"Generating continuous studio audio with {n_photos} melodic photo sections ({int(target_bpm)} BPM)",
+            service="Gemini Lyria 3",
+        )
         generated_ok = _generate_audio_via_gemini_lyria(
             prompt=lyria_prompt,
             output_wav_path=wav_path,
@@ -665,14 +697,15 @@ def generate_custom_music_track(
                 arrangement=str(base_spec["arrangement"]),
             )
 
-    progress.update(55, "Analyzing generated track for beats & cues", service="Librosa")
+    progress.update(55, f"Locating beats & {n_photos} photo-showcase phrases", service="Librosa")
     with progress.scope(55, 100):
         cue_map = analyze_audio_file(
             filepath=str(wav_path),
             track_id=track_id,
-            title=f"Gemini AI Music: {prompt_clean[:38]} ({int(target_bpm)} BPM)",
+            title=f"Gemini AI ({int(target_bpm)} BPM • {n_photos} Photo Cues): {prompt_clean[:34]}",
             url=f"/static/music/{wav_path.name}",
             genre=genre_slug,
             is_generated=True,
+            target_photo_sections=n_photos,
         )
     return register_custom_music_track(cue_map)

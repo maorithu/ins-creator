@@ -37,12 +37,14 @@ def _detect_photo_sections(
     perc: np.ndarray,
     harm_ratio: np.ndarray,
     duration_sec: float,
+    target_photo_sections: Optional[int] = None,
 ) -> List[AudioSectionCue]:
     """
-    Finds photo-friendly windows relative to *this* track's own dynamics:
-    - Pause / breath: smoothed loudness well below the track's median level (>= 0.6s)
-    - Sustained note: percussion drops far below its usual level while harmony keeps ringing (>= 1.0s)
-    The strongest, non-overlapping candidates are kept (about one per 7 seconds of music).
+    Finds N photo-friendly windows relative to *this* track's own natural dynamics:
+    - Pause / rubato breath: smoothed loudness & percussion soften gently (>= 0.6s)
+    - Sustained harmonic swell: legato melody/strings ring out smoothly over softened percussion (>= 1.0s)
+    If `target_photo_sections` (N) is provided, selects N well-spaced, non-overlapping musical windows
+    matched to the user's N photos.
     """
     n = len(grid_times)
     if n < 20:
@@ -76,8 +78,14 @@ def _detect_photo_sections(
         quiet = max(0.05, 1.0 - float(np.mean(p_s[a:b])) / p_med)
         candidates.append(("sustained_note", a, b, seg_e, quiet * (b - a)))
 
-    max_sections = max(2, min(8, int(duration_sec / 7.0) + 1))
-    min_gap = int(round(1.0 / step))
+    if target_photo_sections is not None and target_photo_sections > 0:
+        desired_count = max(2, min(8, int(target_photo_sections)))
+        max_sections = desired_count
+    else:
+        desired_count = 2
+        max_sections = max(2, min(4, int(duration_sec / 8.0) + 1))
+
+    min_gap = max(6, int(round(min(1.6, duration_sec / max(4.0, ( desired_count + 2 ) * 2.0)) / step)))
     candidates.sort(key=lambda c: c[4], reverse=True)
     picked: List[tuple] = []
     for c in candidates:
@@ -88,46 +96,42 @@ def _detect_photo_sections(
         picked.append(c)
 
     # For natural, continuous studio music (without artificial mutes or drum dropouts),
-    # locate the track's natural softest breath phrase ('pause') and most legato harmonic phrase ('sustained_note')
-    # directly from its real energy / harmonic-to-percussive envelopes.
-    picked_types = {p[0] for p in picked}
-    margin = max(edge, int(round(1.8 / step)))
+    # locate up to `desired_count` natural rubato breath phrases ('pause') and legato harmonic swells ('sustained_note')
+    # directly from the track's real energy and harmonic-to-percussive envelopes.
+    margin = max(edge, int(round(1.6 / step)))
     if n > margin * 2 + 22:
-        if "pause" not in picked_types:
-            win_p = int(round(1.8 / step))
-            best_p = None
-            best_p_val = 1e9
-            for a in range(margin, n - margin - win_p):
-                b = a + win_p
-                if any(not (b + min_gap <= p[1] or a >= p[2] + min_gap) for p in picked):
-                    continue
-                seg_e = float(np.mean(e_s[a:b]))
-                if seg_e < best_p_val:
-                    best_p_val = seg_e
-                    best_p = ("pause", a, b, seg_e, 1.0 - seg_e)
-            if best_p is not None:
-                picked.append(best_p)
-                picked_types.add("pause")
+        while len(picked) < desired_count:
+            picked_types = {p[0] for p in picked}
+            # Ensure at least one 'pause' and one 'sustained_note', then alternate for additional photo slots
+            if "pause" not in picked_types:
+                want_type = "pause"
+            elif "sustained_note" not in picked_types:
+                want_type = "sustained_note"
+            else:
+                want_type = "sustained_note" if len(picked) % 2 == 0 else "pause"
 
-        if "sustained_note" not in picked_types:
-            win_s = int(round(2.1 / step))
-            best_s = None
-            best_s_score = -1e9
-            for a in range(margin, n - margin - win_s):
-                b = a + win_s
+            win_len = int(round((1.8 if want_type == "pause" else 2.0) / step))
+            best_cand = None
+            best_score = -1e9
+            for a in range(margin, n - margin - win_len):
+                b = a + win_len
                 if any(not (b + min_gap <= p[1] or a >= p[2] + min_gap) for p in picked):
                     continue
                 seg_e = float(np.mean(e_s[a:b]))
                 seg_h = float(np.mean(h_s[a:b]))
                 seg_p = float(np.mean(p_s[a:b]))
-                # Favor rich harmonic sustain with relatively smooth percussion and healthy volume
-                score = seg_h * (1.0 - 0.45 * seg_p) * (0.4 + 0.6 * min(1.0, seg_e / (med_e + 1e-6)))
-                if score > best_s_score:
-                    best_s_score = score
-                    best_s = ("sustained_note", a, b, seg_e, score)
-            if best_s is not None:
-                picked.append(best_s)
-                picked_types.add("sustained_note")
+                if want_type == "pause":
+                    # Favor gentle dynamic breath where accompaniment & percussion soften naturally
+                    score = (1.0 - seg_e / (med_e + 1e-6)) + 0.55 * (1.0 - seg_p / (p_med + 1e-6))
+                else:
+                    # Favor soaring legato harmonic sustain with smooth percussion and expressive volume
+                    score = seg_h * (1.0 - 0.45 * seg_p) * (0.4 + 0.6 * min(1.0, seg_e / (med_e + 1e-6)))
+                if score > best_score:
+                    best_score = score
+                    best_cand = (want_type, a, b, seg_e, score)
+            if best_cand is None:
+                break
+            picked.append(best_cand)
 
     picked.sort(key=lambda c: c[1])
 
@@ -161,6 +165,7 @@ def analyze_audio_file(
     url: str,
     genre: str = "dance_pop",
     is_generated: bool = False,
+    target_photo_sections: Optional[int] = None,
 ) -> AudioCueMap:
     """
     Uses Librosa to extract:
@@ -287,6 +292,7 @@ def analyze_audio_file(
         perc=perc_interp,
         harm_ratio=harm_ratio,
         duration_sec=duration_sec,
+        target_photo_sections=target_photo_sections,
     )
 
     # Guarantee at least two photo-friendly sustained/pause windows if track was uniformly dense

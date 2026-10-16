@@ -46,7 +46,8 @@ def test_ai_custom_music_generation() -> None:
         "/api/music/generate",
         json={
             "prompt": "Dramatic contemporary lyrical piano build with big competition leaps",
-            "target_duration_sec": 15.0,
+            "target_duration_sec": 18.0,
+            "photo_count": 4,
         },
     )
     assert r.status_code == 200
@@ -54,6 +55,7 @@ def test_ai_custom_music_generation() -> None:
     assert cue_map["is_generated"] is True
     assert Path(cue_map["filepath"]).exists()
     assert len(cue_map["downbeat_times"]) >= 2
+    assert len(cue_map["sections"]) == 4
 
 
 def test_media_search_and_dance_kinematics() -> None:

@@ -123,6 +123,7 @@ class MusicGeneratePayload(BaseModel):
     prompt: str
     target_duration_sec: float = 18.0
     preferred_bpm: Optional[float] = None
+    photo_count: Optional[int] = None
 
 
 _PKCE_VERIFIER_STORE: Dict[str, str] = {}
@@ -373,6 +374,7 @@ def create_ai_music_track(
             prompt=payload.prompt,
             target_duration_sec=payload.target_duration_sec,
             preferred_bpm=payload.preferred_bpm,
+            photo_count=payload.photo_count,
         )
 
 
@@ -549,11 +551,13 @@ def _generate_workflow_session_impl(req: CreateSessionRequest) -> WorkflowSessio
 
     # 2. Music Track Selection / Generation & Cue Analysis
     progress.update(30, "Loading soundtrack beat & cue map", service="Librosa cue map cache")
+    selected_photo_count = sum(1 for m in all_matched if m.media_type.value == "photo")
     if req.music_generation_prompt and req.music_generation_prompt.strip():
         with progress.scope(30, 40):
             audio_cue_map = generate_custom_music_track(
                 prompt=req.music_generation_prompt,
                 target_duration_sec=req.target_duration_sec,
+                photo_count=selected_photo_count if selected_photo_count > 0 else None,
             )
     else:
         wanted_track = req.music_track_id or active_preset.default_music_genre
