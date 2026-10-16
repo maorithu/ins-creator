@@ -40,6 +40,34 @@ STYLE_PRESETS: List[StylePreset] = [
         badge_color="#f59e0b",
     ),
     StylePreset(
+        id="classical_ballet_variation",
+        name="Classical Ballet: Pointe & Grace",
+        tagline="Orchestral harp, violin & celesta variations with poised arabesque holds",
+        description=(
+            "Crafted for classical ballet adagios, waltzes, and petit allegro variations. "
+            "Pairs grand jetés and pirouettes with orchestral downbeats while framing "
+            "poised arabesque and pointe photos inside lush string & harp swells."
+        ),
+        event_focus=EventCategory.SHOWCASE,
+        default_music_genre="ballet_adagio_swan",
+        target_duration_sec=18.0,
+        video_to_photo_ratio=0.60,
+        cut_pacing="slow_lyrical",
+        preferred_photo_effects=[
+            PhotoEffectType.KEN_BURNS_ZOOM_IN,
+            PhotoEffectType.SPOTLIGHT_VIGNETTE,
+            PhotoEffectType.SOFT_GLOW_DISSOLVE,
+        ],
+        preferred_transitions=[
+            TransitionType.CROSS_DISSOLVE,
+            TransitionType.LIGHT_LEAK_WARM,
+        ],
+        color_grade_preset="soft_pastel",
+        speed_ramp_on_peaks=True,
+        caption_tone="poetic_emotional",
+        badge_color="#6366f1",
+    ),
+    StylePreset(
         id="lyrical_graceful_flow",
         name="Lyrical & Graceful Flow",
         tagline="Poetic piano & strings, slow-mo extensions, and dreamy Ken Burns pans",

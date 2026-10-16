@@ -10,9 +10,9 @@ An automated workflow & interactive studio for creating beat-synced Instagram Re
    - Detects **Jump Peaks (Apex frames)** via vertical trajectory extrema and **Turns / Pirouettes** via horizontal rotational optical flow and width oscillation.
 3. **Music Generation, Upload & Beat/Cue Extraction (`backend/services/audio_analyzer.py` & `music_generator.py`)**:
    - Extracts **BPM**, **Beat Grid**, **Measure Downbeats (1-count)**, **Sustained Harmonic Notes**, and **Musical Pauses/Breaths** using **Librosa**.
-   - Includes 4 built-in multi-section dance tracks (*Competition Pop/EDM*, *Lyrical Piano & Strings*, *Studio Hip-Hop Hustle*, *Contemporary Dramatic Build*), custom MP3/WAV upload, and AI Music generation from prompts.
-4. **6 Curated Dance Styles + Free-Form Supplemental Directions (`backend/services/style_presets.py`)**:
-   - Choose from *Competition Stage Glory*, *Lyrical & Graceful Flow*, *Studio Rehearsal: Grit & Glow*, *Technique & Progress Spotlight*, *High-Energy 8-Count Hype*, or *Proud Parent Storyteller*, and steer any session with custom text directions.
+   - Includes 10 built-in Gemini Lyria multi-genre dance tracks across diverse tempos (86–132 BPM) — including 3 **Classical Ballet** tracks (*Swan Lake Reverie Adagio - 86 BPM*, *Valse Royale Waltz - 108 BPM*, *Allegro Brillante Celesta & Pizzicato Variation - 122 BPM*), *Lyrical Grand Piano & Cello (94 BPM)*, *Neoclassical Strings & Piano (104 BPM)*, *Neo-Soul & Hip-Hop Groove (100 BPM)*, *Contemporary Cinematic Crescendo (116 BPM)*, *Broadway Jazz & Brass Groove (120 BPM)*, *Competition Pop/EDM (126 BPM)*, and *Commercial Dance Pop (132 BPM)* — plus custom MP3/WAV upload and Gemini Lyria AI Music generation from prompts.
+4. **7 Curated Dance Styles + Free-Form Supplemental Directions (`backend/services/style_presets.py`)**:
+   - Choose from *Competition Stage Glory*, *Classical Ballet: Pointe & Grace*, *Lyrical & Graceful Flow*, *Studio Rehearsal: Grit & Glow*, *Technique & Progress Spotlight*, *High-Energy 8-Count Hype*, or *Proud Parent Storyteller*, and steer any session with custom text directions.
 5. **Choreographic Beat-Sync Timeline Engine (`backend/services/timeline_composer.py`)**:
    - **Slip-syncs video clips** so jump peaks and turn peaks land directly on musical downbeats (with optional speed ramping).
    - **Inserts curated photos** during sustained notes and musical pauses with **Ken Burns** pan/zoom and beat-pulse visual effects.
