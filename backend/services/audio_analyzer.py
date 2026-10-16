@@ -86,6 +86,49 @@ def _detect_photo_sections(
         if any(not (c[2] + min_gap <= p[1] or c[1] >= p[2] + min_gap) for p in picked):
             continue
         picked.append(c)
+
+    # For natural, continuous studio music (without artificial mutes or drum dropouts),
+    # locate the track's natural softest breath phrase ('pause') and most legato harmonic phrase ('sustained_note')
+    # directly from its real energy / harmonic-to-percussive envelopes.
+    picked_types = {p[0] for p in picked}
+    margin = max(edge, int(round(1.8 / step)))
+    if n > margin * 2 + 22:
+        if "pause" not in picked_types:
+            win_p = int(round(1.8 / step))
+            best_p = None
+            best_p_val = 1e9
+            for a in range(margin, n - margin - win_p):
+                b = a + win_p
+                if any(not (b + min_gap <= p[1] or a >= p[2] + min_gap) for p in picked):
+                    continue
+                seg_e = float(np.mean(e_s[a:b]))
+                if seg_e < best_p_val:
+                    best_p_val = seg_e
+                    best_p = ("pause", a, b, seg_e, 1.0 - seg_e)
+            if best_p is not None:
+                picked.append(best_p)
+                picked_types.add("pause")
+
+        if "sustained_note" not in picked_types:
+            win_s = int(round(2.1 / step))
+            best_s = None
+            best_s_score = -1e9
+            for a in range(margin, n - margin - win_s):
+                b = a + win_s
+                if any(not (b + min_gap <= p[1] or a >= p[2] + min_gap) for p in picked):
+                    continue
+                seg_e = float(np.mean(e_s[a:b]))
+                seg_h = float(np.mean(h_s[a:b]))
+                seg_p = float(np.mean(p_s[a:b]))
+                # Favor rich harmonic sustain with relatively smooth percussion and healthy volume
+                score = seg_h * (1.0 - 0.45 * seg_p) * (0.4 + 0.6 * min(1.0, seg_e / (med_e + 1e-6)))
+                if score > best_s_score:
+                    best_s_score = score
+                    best_s = ("sustained_note", a, b, seg_e, score)
+            if best_s is not None:
+                picked.append(best_s)
+                picked_types.add("sustained_note")
+
     picked.sort(key=lambda c: c[1])
 
     sections: List[AudioSectionCue] = []

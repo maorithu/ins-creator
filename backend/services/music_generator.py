@@ -205,127 +205,6 @@ BUILT_IN_TRACK_SPECS: List[Dict[str, Any]] = [
 ]
 
 
-def _sculpt_choreographic_cues_on_wav(
-    wav_path: Path,
-    pause_window: Tuple[float, float],
-    sustained_window: Tuple[float, float],
-    chord_midi: Tuple[int, ...] = (57, 60, 64, 69),
-    target_duration_sec: Optional[float] = None,
-) -> None:
-    """
-    Takes a Gemini Lyria studio WAV recording and sculpts two unmistakable choreographic regions:
-    1. `pause_window`: A smooth musical breath/pause where loudness dips well below the median
-       so `_detect_photo_sections` reliably identifies the primary `'pause'` window at `pause_window`.
-    2. `sustained_window`: Suppresses percussive transients and blends a lush sustained harmonic chord swell
-       so `_detect_photo_sections` reliably identifies the primary `'sustained_note'` window at `sustained_window`.
-    3. Outside those two windows, gently floors deep silences and maintains steady rhythmic pulse
-       so no spurious secondary pause/sustained windows outrank the choreographed windows.
-    """
-    y, sr = librosa.load(str(wav_path), sr=22050, mono=True)
-    if target_duration_sec is not None and target_duration_sec > 8.0:
-        max_samples = int(round(target_duration_sec * sr))
-        if len(y) > max_samples:
-            y = y[:max_samples]
-    n_samples = len(y)
-    dur = n_samples / float(sr)
-    if dur < 10.0:
-        return
-
-    t = np.arange(n_samples, dtype=np.float64) / float(sr)
-    p0, p1 = pause_window
-    s0, s1 = sustained_window
-
-    # Separate harmonic and percussive components of the Gemini Lyria recording
-    y_harm, _ = librosa.effects.hpss(y)
-    out_audio = y.astype(np.float64).copy()
-
-    # Build a warm background harmonic bed from chord_midi to support any quiet intro/outro passages
-    # outside `pause_window` so `e_s < pause_thr` ONLY triggers inside `pause_window`
-    bg_pad = np.zeros(n_samples, dtype=np.float64)
-    for m_note in chord_midi:
-        f = _midi_to_freq(m_note)
-        bg_pad += 0.08 * np.sin(2.0 * np.pi * f * t) + 0.04 * np.sin(2.0 * np.pi * (f * 2.0) * t)
-
-    # Ensure non-pause regions maintain healthy RMS >= 0.78 * median RMS
-    win_len = int(0.35 * sr)
-    if win_len > 10:
-        local_rms = np.sqrt(np.convolve(out_audio ** 2, np.ones(win_len) / win_len, mode="same") + 1e-8)
-        med_rms = max(0.12, float(np.median(local_rms)))
-        floor_target = med_rms * 0.78
-        for i in range(n_samples):
-            ti = i / float(sr)
-            if not (p0 - 0.15 <= ti <= p1 + 0.15) and not (s0 - 0.15 <= ti <= s1 + 0.15):
-                if local_rms[i] < floor_target:
-                    lift = min(2.8, floor_target / max(0.02, local_rms[i]))
-                    out_audio[i] = out_audio[i] * lift + bg_pad[i] * 0.45
-
-    # Add crisp rhythmic percussive pulse ticks every 0.20s outside `sustained_window` & `pause_window`
-    # so `p_med` (median percussion) is well-defined and `p_s < p_med * 0.45` is strictly confined to `sustained_window`
-    tick_interval = int(0.20 * sr)
-    rng = np.random.default_rng(seed=99)
-    for start_i in range(int(0.25 * sr), n_samples - int(0.25 * sr), tick_interval):
-        ti = start_i / float(sr)
-        if (p0 - 0.12 <= ti <= p1 + 0.12) or (s0 - 0.12 <= ti <= s1 + 0.12):
-            continue
-        t_len = min(int(0.028 * sr), n_samples - start_i)
-        if t_len > 4:
-            seg_t = np.arange(t_len, dtype=np.float64) / float(sr)
-            shaker = 0.11 * rng.normal(0.0, 1.0, t_len) * np.exp(-seg_t * 95.0)
-            out_audio[start_i : start_i + t_len] += shaker
-
-    # 1. Sculpt the Sustained Harmonic Note Window `[s0, s1]` (pure steady harmonic chord swell, zero percussion)
-    s_i0, s_i1 = max(0, int(s0 * sr)), min(n_samples, int(s1 * sr))
-    if s_i1 > s_i0 + 100:
-        s_len = s_i1 - s_i0
-        seg_t = np.arange(s_len, dtype=np.float64) / float(sr)
-        s_dur = s_len / float(sr)
-        swell_env = 0.78 + 0.22 * np.sin(np.pi * seg_t / max(0.2, s_dur))
-
-        # Pure harmonic orchestral chord pad (zero vertical broadband transients in STFT -> 99.8% harmonic in HPSS)
-        chord_pad = np.zeros(s_len, dtype=np.float64)
-        for m_note in chord_midi:
-            f = _midi_to_freq(m_note + 12)
-            chord_pad += (
-                0.16 * np.sin(2.0 * np.pi * f * seg_t)
-                + 0.08 * np.sin(2.0 * np.pi * (f * 2.0) * seg_t)
-                + 0.03 * np.sin(2.0 * np.pi * (f * 3.0) * seg_t)
-            )
-
-        # Low-pass filter `y_harm[s_i0:s_i1]` gently for organic timbre while keeping zero percussive energy
-        sos_lp = signal.butter(4, 900.0 / (0.5 * sr), btype="low", output="sos")
-        pure_harm = signal.sosfilt(sos_lp, y_harm[s_i0:s_i1].astype(np.float64))
-        sust_target = (0.18 * pure_harm + 0.82 * chord_pad) * swell_env
-
-        # Normalize `sust_target` so its RMS is above median RMS (`e_s >= pause_thr` with wide margin)
-        overall_rms = float(np.sqrt(np.mean(out_audio ** 2)) + 1e-6)
-        cur_rms = float(np.sqrt(np.mean(sust_target ** 2)) + 1e-6)
-        sust_target = sust_target * ((overall_rms * 1.15) / cur_rms)
-
-        fade = min(int(0.05 * sr), s_len // 8)
-        cross = np.ones(s_len, dtype=np.float64)
-        if fade > 2:
-            cross[:fade] = np.linspace(0.0, 1.0, fade)
-            cross[-fade:] = np.linspace(1.0, 0.0, fade)
-        out_audio[s_i0:s_i1] = (1.0 - cross) * out_audio[s_i0:s_i1] + cross * sust_target
-
-    # 2. Sculpt the Musical Pause / Breath Window `[p0, p1]` (smooth attenuation to ~3% amplitude)
-    p_i0, p_i1 = max(0, int(p0 * sr)), min(n_samples, int(p1 * sr))
-    if p_i1 > p_i0 + 100:
-        p_len = p_i1 - p_i0
-        taper = np.full(p_len, 0.03, dtype=np.float64)
-        fade = min(int(0.05 * sr), p_len // 8)
-        if fade > 2:
-            taper[:fade] = np.linspace(1.0, 0.03, fade)
-            taper[-fade:] = np.linspace(0.03, 1.0, fade)
-        out_audio[p_i0:p_i1] *= taper
-
-    peak = float(np.max(np.abs(out_audio)))
-    if peak > 1e-5:
-        out_audio = (out_audio / peak) * 0.90
-
-    sf.write(str(wav_path), out_audio.astype(np.float32), sr, subtype="PCM_16")
-
-
 def _enrich_music_prompt_with_gemini(
     user_prompt: str, target_duration_sec: float, preferred_bpm: Optional[float]
 ) -> Tuple[str, str, float]:
@@ -340,7 +219,7 @@ def _enrich_music_prompt_with_gemini(
 
     if not settings.gemini_api_key:
         return (
-            f"Instrumental dance soundtrack: {user_prompt}. {int(default_bpm)} BPM, expressive melody and clear measure downbeats. Instrumental only, no vocals.",
+            f"Continuous, natural instrumental dance soundtrack: {user_prompt}. {int(default_bpm)} BPM, expressive flowing melody and clear measure downbeats. Instrumental only, no vocals.",
             default_genre,
             default_bpm,
         )
@@ -353,7 +232,7 @@ def _enrich_music_prompt_with_gemini(
         sys_instruction = (
             "You are an expert dance music director and composer. "
             "Given a user's music request for a dance video reel, output a JSON object with keys:\n"
-            '- "lyria_prompt": A vivid 2-3 sentence instrumental music generation prompt specifying exact acoustic/electronic instruments, key/mood, rhythmic feel, and clear measure downbeats for dance jumps/turns. CRITICAL RULE: Never mention any real artist, composer, band, or copyrighted song names (translate any artist/song reference into pure musical style, era, and instrumentation descriptions). Always end with "Instrumental only, no vocals."\n'
+            '- "lyria_prompt": A vivid 2-3 sentence instrumental music generation prompt specifying exact acoustic/electronic instruments, key/mood, continuous natural flowing musicality (no abrupt stops or mutes), and clear rhythmic pulse for dance. CRITICAL RULE: Never mention any real artist, composer, band, or copyrighted song names (translate any artist/song reference into pure musical style, era, and instrumentation descriptions). Always end with "Continuous studio instrumental only, no vocals."\n'
             '- "genre": A short snake_case genre tag (e.g. "classical_ballet_adagio", "classical_ballet_waltz", "classical_ballet_variation", "lyrical_piano_strings", "neoclassical_strings", "contemporary_cinematic", "jazz_broadway_groove", "studio_hiphop_beat", "latin_ballroom", "competition_edm_pop").\n'
             '- "bpm": Ideal numeric tempo in BPM between 76 and 145 matching the requested style.'
         )
@@ -377,7 +256,7 @@ def _enrich_music_prompt_with_gemini(
         pass
 
     return (
-        f"Instrumental dance music for: {user_prompt}. Expressive melody, authentic instrumentation, {int(default_bpm)} BPM, clear measure downbeat accents. Instrumental only, no vocals.",
+        f"Continuous, natural instrumental dance music for: {user_prompt}. Expressive flowing melody, authentic instrumentation, {int(default_bpm)} BPM. Instrumental only, no vocals.",
         default_genre,
         default_bpm,
     )
@@ -389,12 +268,11 @@ def _generate_audio_via_gemini_lyria(
     pause_window: Optional[Tuple[float, float]] = None,
     sustained_window: Optional[Tuple[float, float]] = None,
     chord_midi: Tuple[int, ...] = (57, 60, 64, 69),
-    target_duration_sec: float = 21.0,
+    target_duration_sec: float = 30.0,
 ) -> bool:
     """
     Calls Gemini's Lyria music generation model (`models/lyria-3-clip-preview` / `models/lyria-3.5`)
-    using `settings.gemini_api_key` to generate real studio-quality music audio, trims to `target_duration_sec`,
-    and sculpts the choreographic pause & sustained harmonic cues.
+    using `settings.gemini_api_key` to generate natural, continuous studio-quality music audio without artificial mutes or holds.
     """
     if not settings.gemini_api_key:
         return False
@@ -405,7 +283,6 @@ def _generate_audio_via_gemini_lyria(
 
         client = genai.Client(api_key=settings.gemini_api_key)
         audio_bytes: Optional[bytes] = None
-        mime_type: str = "audio/mpeg"
 
         for attempt in range(2):
             for model_name in GEMINI_MUSIC_MODELS:
@@ -421,7 +298,6 @@ def _generate_audio_via_gemini_lyria(
                             for part in cand.content.parts:
                                 if part.inline_data and part.inline_data.data and len(part.inline_data.data) > 10_000:
                                     audio_bytes = part.inline_data.data
-                                    mime_type = part.inline_data.mime_type or "audio/mpeg"
                                     break
                             if audio_bytes:
                                 break
@@ -446,13 +322,13 @@ def _generate_audio_via_gemini_lyria(
                 "-y",
                 "-i",
                 str(tmp_mp3),
-                "-t",
-                f"{target_duration_sec:.2f}",
                 "-vn",
                 "-ac",
                 "1",
                 "-ar",
                 "22050",
+                "-acodec",
+                "pcm_s16le",
                 str(output_wav_path),
             ],
             check=True,
@@ -461,17 +337,7 @@ def _generate_audio_via_gemini_lyria(
         )
         tmp_mp3.unlink(missing_ok=True)
 
-        if output_wav_path.exists() and output_wav_path.stat().st_size > 20_000:
-            if pause_window and sustained_window:
-                _sculpt_choreographic_cues_on_wav(
-                    wav_path=output_wav_path,
-                    pause_window=pause_window,
-                    sustained_window=sustained_window,
-                    chord_midi=chord_midi,
-                    target_duration_sec=target_duration_sec,
-                )
-            return True
-        return False
+        return output_wav_path.exists() and output_wav_path.stat().st_size > 20_000
     except Exception:
         return False
 
@@ -516,8 +382,6 @@ def _synthesize_dance_track_wav(
         audio[s_idx:e_idx] += chord_wave * env
 
     for b_idx, bt in enumerate(beat_times):
-        if (p_start <= bt <= p_end) or (s_start <= bt <= s_end):
-            continue
         b_sample = int(bt * sr)
         hit_len = int(0.26 * sr)
         end_sample = min(n_samples, b_sample + hit_len)
@@ -543,27 +407,11 @@ def _synthesize_dance_track_wav(
                 kick = 0.42 * np.sin(phase) * np.exp(-seg_t * 14.0)
                 audio[b_sample:end_sample] += kick + mel_note
 
-    s_i0, s_i1 = int(s_start * sr), min(n_samples, int(s_end * sr))
-    if s_i1 > s_i0:
-        seg_t = t[s_i0:s_i1] - s_start
-        swell_env = np.sin(np.pi * seg_t / max(0.2, (s_end - s_start)))
-        root_f = _midi_to_freq(chords_midi[0][0])
-        fifth_f = _midi_to_freq(chords_midi[0][2])
-        audio[s_i0:s_i1] = (
-            0.34 * np.sin(2 * np.pi * root_f * seg_t)
-            + 0.24 * np.sin(2 * np.pi * fifth_f * seg_t)
-            + 0.16 * np.sin(2 * np.pi * (root_f * 2.0) * seg_t)
-        ) * swell_env
-
-    p_i0, p_i1 = int(p_start * sr), min(n_samples, int(p_end * sr))
-    if p_i1 > p_i0:
-        audio[p_i0:p_i1] *= 0.06
-
     peak = float(np.max(np.abs(audio)))
     if peak > 1e-5:
         audio = (audio / peak) * 0.90
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(filepath), audio.astype(np.float32), sr)
+    sf.write(str(filepath), audio.astype(np.float32), sr, subtype="PCM_16")
 
 
 # ============================================================================

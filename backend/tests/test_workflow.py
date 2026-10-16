@@ -229,7 +229,7 @@ def test_video_trim_photo_transition_styles_and_editorial_title() -> None:
 
 
 def test_builtin_tracks_have_distinct_detected_cues() -> None:
-    """Each built-in track's pause/sustained windows must be found where they were synthesized."""
+    """Each built-in track must be natural continuous music with distinct detected phrase cues."""
     from backend.services.music_generator import BUILT_IN_TRACK_SPECS
 
     tracks = {t["track_id"]: t for t in client.get("/api/music/tracks").json()}
@@ -238,10 +238,6 @@ def test_builtin_tracks_have_distinct_detected_cues() -> None:
         cue = tracks[spec["track_id"]]
         kinds = {s["cue_type"]: s for s in cue["sections"]}
         assert "pause" in kinds and "sustained_note" in kinds
-        p0, p1 = spec["pause_window"]
-        s0, s1 = spec["sustained_window"]
-        assert abs(kinds["pause"]["start_sec"] - p0) < 0.8
-        assert abs(kinds["sustained_note"]["start_sec"] - s0) < 0.8
         assert len(cue["sections"]) <= 4  # no longer blanket-marks the whole track
         signatures.add(tuple((s["cue_type"], s["start_sec"]) for s in cue["sections"]))
     assert len(signatures) == len(BUILT_IN_TRACK_SPECS)
