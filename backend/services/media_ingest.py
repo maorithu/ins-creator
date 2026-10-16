@@ -86,76 +86,125 @@ class GooglePhotosClient:
     def is_configured(self) -> bool:
         return bool(self.access_token and len(self.access_token.strip()) > 10)
 
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.access_token}"}
+
     def create_picker_session(self) -> Dict[str, object]:
-        """Creates an interactive Google Photos Picker session or returns setup instructions if token is missing."""
+        """Creates an interactive Google Photos Picker session, refreshing OAuth token if expired."""
         if not self.is_configured:
             return {
                 "configured": False,
                 "mode": "demo_or_token_required",
-                "message": (
-                    "Google Photos OAuth access token not yet configured. "
-                    "Paste a Google Photos OAuth Bearer token in Settings or use Smart Local / Sample Dance Library."
-                ),
-                "pickerUri": "https://photos.google.com",
+                "message": "Please sign in with Google first to open the Google Photos Picker.",
             }
         try:
             resp = httpx.post(
                 "https://photospicker.googleapis.com/v1/sessions",
-                headers={"Authorization": f"Bearer {self.access_token}"},
+                headers=self._headers(),
                 json={},
                 timeout=15.0,
             )
+            if resp.status_code == 401:
+                refreshed = settings.refresh_google_access_token_if_needed()
+                if refreshed:
+                    self.access_token = refreshed
+                    resp = httpx.post(
+                        "https://photospicker.googleapis.com/v1/sessions",
+                        headers=self._headers(),
+                        json={},
+                        timeout=15.0,
+                    )
+
             if resp.status_code == 200:
                 data = resp.json()
+                session_id = str(data.get("id") or "")
+                if session_id:
+                    settings.save_oauth_tokens(last_picker_session_id=session_id)
                 return {
                     "configured": True,
-                    "sessionId": data.get("id"),
+                    "sessionId": session_id,
                     "pickerUri": data.get("pickerUri"),
                     "pollingConfig": data.get("pollingConfig", {}),
                 }
             return {
                 "configured": False,
-                "error": f"Picker API returned status {resp.status_code}: {resp.text[:200]}",
+                "error": f"Picker API returned status {resp.status_code}: {resp.text[:250]}",
             }
         except Exception as exc:
             return {"configured": False, "error": str(exc)}
 
+    def get_picker_session_status(self, picker_session_id: Optional[str] = None) -> Dict[str, object]:
+        """Checks whether the user has finished selecting media (`mediaItemsSet == True`) in the Picker session."""
+        session_id = picker_session_id or settings.last_picker_session_id
+        if not self.is_configured or not session_id:
+            return {"sessionId": session_id, "mediaItemsSet": False, "ready": False}
+
+        try:
+            resp = httpx.get(
+                f"https://photospicker.googleapis.com/v1/sessions/{session_id}",
+                headers=self._headers(),
+                timeout=15.0,
+            )
+            if resp.status_code == 401:
+                refreshed = settings.refresh_google_access_token_if_needed()
+                if refreshed:
+                    self.access_token = refreshed
+                    resp = httpx.get(
+                        f"https://photospicker.googleapis.com/v1/sessions/{session_id}",
+                        headers=self._headers(),
+                        timeout=15.0,
+                    )
+            if resp.status_code == 200:
+                data = resp.json()
+                items_set = bool(data.get("mediaItemsSet", False))
+                return {
+                    "sessionId": session_id,
+                    "mediaItemsSet": items_set,
+                    "pickerUri": data.get("pickerUri"),
+                }
+            return {"sessionId": session_id, "mediaItemsSet": False, "error": resp.text[:200]}
+        except Exception as exc:
+            return {"sessionId": session_id, "mediaItemsSet": False, "error": str(exc)}
+
     def fetch_media_by_query_or_session(
-        self, query: str, picker_session_id: Optional[str] = None, max_items: int = 12
+        self, query: str = "", picker_session_id: Optional[str] = None, max_items: int = 25
     ) -> List[MediaItem]:
         """
-        Fetches photos and videos from Google Photos Picker session or Library search API,
+        Fetches photos and videos from the active Google Photos Picker session (or Library API),
         downloads them into `MEDIA_CACHE_DIR`, and runs the dance CV analyzer on each item.
         """
         if not self.is_configured:
             return []
 
-        headers = {"Authorization": f"Bearer {self.access_token}"}
+        active_session_id = picker_session_id or settings.last_picker_session_id
         raw_items: List[Dict[str, object]] = []
 
         try:
-            if picker_session_id:
+            if active_session_id:
                 resp = httpx.get(
                     "https://photospicker.googleapis.com/v1/mediaItems",
-                    headers=headers,
-                    params={"sessionId": picker_session_id, "pageSize": max_items},
-                    timeout=20.0,
+                    headers=self._headers(),
+                    params={"sessionId": active_session_id, "pageSize": max_items},
+                    timeout=25.0,
                 )
+                if resp.status_code == 401:
+                    refreshed = settings.refresh_google_access_token_if_needed()
+                    if refreshed:
+                        self.access_token = refreshed
+                        resp = httpx.get(
+                            "https://photospicker.googleapis.com/v1/mediaItems",
+                            headers=self._headers(),
+                            params={"sessionId": active_session_id, "pageSize": max_items},
+                            timeout=25.0,
+                        )
                 if resp.status_code == 200:
                     raw_items = resp.json().get("mediaItems", [])
-            else:
-                # Fallback to Google Photos Library search with contentFilter PERFORMANCES / SPORT
-                resp = httpx.post(
-                    "https://photoslibrary.googleapis.com/v1/mediaItems:search",
-                    headers=headers,
-                    json={
-                        "pageSize": max_items,
-                        "filters": {
-                            "contentFilter": {
-                                "includedContentCategories": ["PERFORMANCES", "SPORT", "PEOPLE"]
-                            }
-                        },
-                    },
+            if not raw_items:
+                # Fallback to Google Photos Library list if Picker session had no items
+                resp = httpx.get(
+                    "https://photoslibrary.googleapis.com/v1/mediaItems",
+                    headers=self._headers(),
+                    params={"pageSize": max_items},
                     timeout=20.0,
                 )
                 if resp.status_code == 200:
@@ -165,49 +214,104 @@ class GooglePhotosClient:
 
         ingested: List[MediaItem] = []
         for entry in raw_items[:max_items]:
-            media_file = entry.get("mediaFile", entry) if isinstance(entry, dict) else {}
+            if not isinstance(entry, dict):
+                continue
+            media_file = entry.get("mediaFile", entry)
+            if not isinstance(media_file, dict):
+                media_file = entry
+
             item_id = str(entry.get("id") or hashlib.md5(str(entry).encode()).hexdigest()[:10])
             base_url = str(media_file.get("baseUrl") or entry.get("baseUrl") or "")
-            mime_type = str(media_file.get("mimeType") or entry.get("mimeType") or "image/jpeg")
-            filename = str(media_file.get("filename") or entry.get("filename") or f"gphoto_{item_id}.jpg")
+            mime_type = str(media_file.get("mimeType") or entry.get("mimeType") or "").lower()
+            entry_type = str(entry.get("type") or "").upper()
+            filename = str(
+                media_file.get("filename")
+                or entry.get("filename")
+                or f"gphoto_{item_id[:8]}"
+            )
 
             if not base_url:
                 continue
 
-            is_video = mime_type.startswith("video")
+            is_video = (
+                mime_type.startswith("video")
+                or entry_type == "VIDEO"
+                or Path(filename).suffix.lower() in VIDEO_EXTENSIONS
+            )
             download_url = f"{base_url}=dv" if is_video else f"{base_url}=d"
             ext = ".mp4" if is_video else ".jpg"
-            local_path = MEDIA_CACHE_DIR / f"gp_{item_id}{ext}"
+            if not Path(filename).suffix:
+                filename = f"{filename}{ext}"
+            local_path = MEDIA_CACHE_DIR / f"gp_{item_id[:16]}{ext}"
 
-            if not local_path.exists():
+            if not local_path.exists() or local_path.stat().st_size < 500:
                 try:
-                    dl = httpx.get(download_url, headers=headers, follow_redirects=True, timeout=30.0)
-                    if dl.status_code == 200:
+                    # Try authenticated download first (required by Picker API baseUrls), then unauthenticated fallback
+                    dl = httpx.get(
+                        download_url,
+                        headers=self._headers(),
+                        follow_redirects=True,
+                        timeout=45.0,
+                    )
+                    if dl.status_code != 200 or len(dl.content) < 500:
+                        dl = httpx.get(download_url, follow_redirects=True, timeout=45.0)
+                    if dl.status_code == 200 and len(dl.content) >= 500:
                         local_path.write_bytes(dl.content)
                     else:
                         continue
                 except Exception:
                     continue
 
-            media_obj = MediaItem(
-                id=f"gp_{item_id}",
-                filename=filename,
-                filepath=str(local_path),
-                url=f"/static/cache/{local_path.name}",
+            cache_id = f"gp_{item_id[:16]}"
+            if cache_id not in _ANALYZED_MEDIA_CACHE:
+                media_obj = MediaItem(
+                    id=cache_id,
+                    filename=filename,
+                    filepath=str(local_path),
+                    url=f"/static/cache/{local_path.name}",
+                    media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
+                    event_category=_infer_event_category_from_text(f"{filename} {query}"),
+                    tags=["google_photos", "dance"],
+                    semantic_caption=f"Imported from Google Photos ({filename})",
+                    source="google_photos",
+                )
+                if is_video:
+                    media_obj = analyze_video_dance_kinematics(media_obj)
+                else:
+                    media_obj = analyze_photo_item(media_obj)
+                _ANALYZED_MEDIA_CACHE[cache_id] = media_obj
+
+            ingested.append(_ANALYZED_MEDIA_CACHE[cache_id].model_copy(deep=True))
+
+        return ingested
+
+
+def list_imported_google_photos() -> List[MediaItem]:
+    """Returns any previously downloaded Google Photos media items stored in MEDIA_CACHE_DIR."""
+    results: List[MediaItem] = []
+    for fpath in sorted(MEDIA_CACHE_DIR.glob("gp_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not fpath.is_file() or fpath.stat().st_size < 500:
+            continue
+        cache_id = fpath.stem
+        if cache_id not in _ANALYZED_MEDIA_CACHE:
+            is_video = fpath.suffix.lower() in VIDEO_EXTENSIONS
+            item = MediaItem(
+                id=cache_id,
+                filename=fpath.name,
+                filepath=str(fpath),
+                url=f"/static/cache/{fpath.name}",
                 media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
-                event_category=_infer_event_category_from_text(f"{filename} {query}"),
                 tags=["google_photos", "dance"],
-                semantic_caption=f"Fetched from Google Photos for query '{query}' ({filename})",
+                semantic_caption=f"Imported from Google Photos ({fpath.name})",
                 source="google_photos",
             )
             if is_video:
-                media_obj = analyze_video_dance_kinematics(media_obj)
+                item = analyze_video_dance_kinematics(item)
             else:
-                media_obj = analyze_photo_item(media_obj)
-            media_obj.query_match_score = _score_query_match(query, media_obj)
-            ingested.append(media_obj)
-
-        return ingested
+                item = analyze_photo_item(item)
+            _ANALYZED_MEDIA_CACHE[cache_id] = item
+        results.append(_ANALYZED_MEDIA_CACHE[cache_id].model_copy(deep=True))
+    return results
 
 
 def load_and_analyze_sample_dataset(query: str = "") -> List[MediaItem]:
@@ -321,23 +425,30 @@ def search_and_ingest_media(
                 query=query, picker_session_id=google_photos_session_id
             )
             candidates.extend(gp_items)
+        # Also include any already-imported Google Photos items cached on disk
+        existing_gp_ids = {c.id for c in candidates}
+        for cached_gp in list_imported_google_photos():
+            if cached_gp.id not in existing_gp_ids:
+                candidates.append(cached_gp)
 
     if local_folder_path:
         candidates.extend(scan_local_directory(local_folder_path, query=query))
 
     # Always include any files uploaded via the web studio
     uploaded_items = scan_local_directory(str(UPLOADS_DIR), query=query)
-    candidates.extend(uploaded_items)
+    existing_ids = {c.id for c in candidates}
+    for u in uploaded_items:
+        if u.id not in existing_ids:
+            candidates.append(u)
+            existing_ids.add(u.id)
 
-    # Include sample dataset when in auto/sample mode or if fewer than 4 items were found
-    if media_source in ("sample", "auto") or len(candidates) < 4:
+    # Only include sample dataset when explicitly requested or when no user media has been imported/uploaded yet
+    if media_source == "sample" or (media_source == "auto" and len(candidates) == 0):
         sample_items = load_and_analyze_sample_dataset(query=query)
-        existing_ids = {c.id for c in candidates}
         for s in sample_items:
             if s.id not in existing_ids:
                 candidates.append(s)
 
-    # Sort by query match + aesthetic quality while keeping a healthy mix of videos and photos
     candidates.sort(
         key=lambda m: (m.query_match_score * 0.65 + m.aesthetic_score * 0.35),
         reverse=True,

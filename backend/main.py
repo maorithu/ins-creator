@@ -313,6 +313,39 @@ def start_google_photos_picker_session() -> Dict[str, object]:
     return client.create_picker_session()
 
 
+@app.get("/api/media/google-photos/picker-session/{session_id}")
+def poll_google_photos_picker_session(session_id: str) -> Dict[str, object]:
+    """Polls the Google Photos Picker session; when mediaItemsSet is True, automatically downloads & analyzes the picked items."""
+    client = GooglePhotosClient()
+    status = client.get_picker_session_status(picker_session_id=session_id)
+    if status.get("mediaItemsSet"):
+        items = client.fetch_media_by_query_or_session(picker_session_id=session_id)
+        status["importedItems"] = [item.model_dump() for item in items]
+        status["importedCount"] = len(items)
+    return status
+
+
+@app.post("/api/media/google-photos/import", response_model=List[MediaItem])
+def import_from_google_photos_session(session_id: Optional[str] = None) -> List[MediaItem]:
+    """Manually triggers downloading and analyzing media from the latest Google Photos Picker session."""
+    client = GooglePhotosClient()
+    return client.fetch_media_by_query_or_session(picker_session_id=session_id)
+
+
+@app.post("/api/media/clear")
+def clear_imported_and_uploaded_media() -> Dict[str, object]:
+    """Clears cached Google Photos and uploaded files so the user can start fresh with a new batch."""
+    from backend.services.media_ingest import _ANALYZED_MEDIA_CACHE
+
+    for f in MEDIA_CACHE_DIR.glob("gp_*"):
+        f.unlink(missing_ok=True)
+    for f in UPLOADS_DIR.glob("*"):
+        if f.is_file():
+            f.unlink(missing_ok=True)
+    _ANALYZED_MEDIA_CACHE.clear()
+    return {"status": "cleared"}
+
+
 @app.post("/api/media/upload", response_model=List[MediaItem])
 async def upload_media_files(
     files: List[UploadFile] = File(...),

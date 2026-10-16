@@ -1,8 +1,5 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  Search,
-  Music,
-  Film,
   Image as ImageIcon,
   Play,
   Download,
@@ -18,6 +15,7 @@ import {
   FolderOpen,
   FileText,
   Sliders,
+  Trash2,
 } from 'lucide-react';
 import {
   AudioCueMap,
@@ -47,8 +45,8 @@ const TRANSITION_OPTIONS = [
 const WORKFLOW_STEPS = [
   {
     number: 1,
-    title: 'Source Media',
-    subtitle: 'Search Google Photos or local files',
+    title: 'Import Media',
+    subtitle: 'Google Photos or local folder upload',
   },
   {
     number: 2,
@@ -78,18 +76,19 @@ export function App() {
   const [selectedMediaIds, setSelectedMediaIds] = useState<Set<string>>(new Set());
 
   // User workflow inputs
-  const [searchQuery, setSearchQuery] = useState(
-    'daughter contemporary dance competition split leaps, rehearsal turns & backstage smiles'
-  );
-  const [mediaSource, setMediaSource] = useState<'auto' | 'google_photos' | 'local' | 'sample'>('auto');
-  const [localFolderPath, setLocalFolderPath] = useState('');
   const [selectedPresetId, setSelectedPresetId] = useState('competition_stage_glory');
   const [supplementalDirections, setSupplementalDirections] = useState(
-    'Sync her highest grand jeté jump peak to the main measure downbeat with slow-motion at the apex, insert a poised stage photo during the sustained note with Ken Burns zoom, and write an inspiring proud-parent caption.'
+    'Sync her highest jump peak to the main measure downbeat with slow-motion at the apex, insert a poised photo during the sustained note with Ken Burns zoom, and write an inspiring proud-parent caption.'
   );
   const [selectedMusicId, setSelectedMusicId] = useState('competition_edm_pop');
   const [customMusicPrompt, setCustomMusicPrompt] = useState('');
   const [targetDurationSec, setTargetDurationSec] = useState(16);
+
+  // Active Google Photos Picker polling state
+  const [activePickerSessionId, setActivePickerSessionId] = useState<string | null>(null);
+  const [isWaitingForGooglePicker, setIsWaitingForGooglePicker] = useState(false);
+  const [isImportingMedia, setIsImportingMedia] = useState(false);
+  const pickerPollTimerRef = useRef<number | null>(null);
 
   // Active generated session state
   const [session, setSession] = useState<WorkflowSession | null>(null);
@@ -98,7 +97,6 @@ export function App() {
   const [selectedCaptionVariantIdx, setSelectedCaptionVariantIdx] = useState<number>(-1);
 
   // UI status state
-  const [isSearchingMedia, setIsSearchingMedia] = useState(false);
   const [isGeneratingSession, setIsGeneratingSession] = useState(false);
   const [isUpdatingTimeline, setIsUpdatingTimeline] = useState(false);
   const [isGeneratingMusic, setIsGeneratingMusic] = useState(false);
@@ -117,25 +115,30 @@ export function App() {
       if (event.data && event.data.type === 'GOOGLE_PHOTOS_CONNECTED') {
         setGooglePhotosConnected(true);
         setShowSettingsModal(false);
-        setStatusMessage('Google Photos account connected! Click "Google Photos" to pick your album or photos.');
+        setStatusMessage(
+          'Google Photos account connected! Click "Import from Google Photos" to select your photos and videos.'
+        );
       }
     };
     window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      if (pickerPollTimerRef.current) {
+        window.clearInterval(pickerPollTimerRef.current);
+      }
+    };
   }, []);
 
   async function loadInitialCatalog() {
     try {
-      const [hRes, pRes, mRes, mediaRes] = await Promise.all([
+      const [hRes, pRes, mRes] = await Promise.all([
         fetch('/api/health'),
         fetch('/api/presets'),
         fetch('/api/music/tracks'),
-        fetch(`/api/media/search?query=${encodeURIComponent(searchQuery)}&source=auto`),
       ]);
       const hData = await hRes.json();
       const pData: StylePreset[] = await pRes.json();
       const mData: AudioCueMap[] = await mRes.json();
-      const mediaData: MediaItem[] = await mediaRes.json();
 
       if (hData.google_client_id) {
         setGoogleClientIdInput(hData.google_client_id);
@@ -143,57 +146,206 @@ export function App() {
       setGooglePhotosConnected(Boolean(hData.google_photos_configured));
       setPresets(pData);
       setMusicTracks(mData);
-      setMatchedMedia(mediaData);
-      setSelectedMediaIds(new Set(mediaData.map((m) => m.id)));
 
-      // Pre-populate a default session in the background so Step 4 is ready immediately if inspected
-      const genRes = await fetch('/api/sessions/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          search_query: searchQuery,
-          media_source: 'auto',
-          style_preset_id: pData[0]?.id || 'competition_stage_glory',
-          supplemental_directions: supplementalDirections,
-          music_track_id: mData[0]?.track_id || 'competition_edm_pop',
-          target_duration_sec: targetDurationSec,
-          auto_render_mp4: true,
-          auto_export_capcut: true,
-        }),
-      });
-      if (genRes.ok) {
-        const sess: WorkflowSession = await genRes.json();
-        setSession(sess);
-        setTimelineClips(sess.timeline_clips);
-        setPostCopy(sess.post_copy || null);
+      // Check if user already has imported Google Photos or uploaded local files from a recent session
+      const mediaRes = await fetch('/api/media/search?source=google_photos');
+      if (mediaRes.ok) {
+        const mediaData: MediaItem[] = await mediaRes.json();
+        const userOnly = mediaData.filter((m) => m.source !== 'sample');
+        if (userOnly.length > 0) {
+          setMatchedMedia(userOnly);
+          setSelectedMediaIds(new Set(userOnly.map((m) => m.id)));
+        }
       }
     } catch (err) {
       console.error('Failed loading initial catalog:', err);
     }
   }
 
-  async function handleSearchMedia() {
-    setIsSearchingMedia(true);
-    setStatusMessage('Searching and analyzing dance kinematics (jump peaks, turns, sharpness)...');
-    try {
-      const params = new URLSearchParams({
-        query: searchQuery,
-        source: mediaSource,
-      });
-      if (localFolderPath.trim()) {
-        params.set('local_folder_path', localFolderPath.trim());
+  function stopPickerPolling() {
+    if (pickerPollTimerRef.current) {
+      window.clearInterval(pickerPollTimerRef.current);
+      pickerPollTimerRef.current = null;
+    }
+    setIsWaitingForGooglePicker(false);
+  }
+
+  function startPickerPolling(sessionId: string) {
+    stopPickerPolling();
+    setActivePickerSessionId(sessionId);
+    setIsWaitingForGooglePicker(true);
+
+    pickerPollTimerRef.current = window.setInterval(async () => {
+      try {
+        const res = await fetch(`/api/media/google-photos/picker-session/${sessionId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.mediaItemsSet && Array.isArray(data.importedItems)) {
+          stopPickerPolling();
+          const imported: MediaItem[] = data.importedItems;
+          if (imported.length > 0) {
+            setMatchedMedia((prev) => {
+              const nonSample = prev.filter((p) => p.source !== 'sample');
+              const existingIds = new Set(imported.map((i) => i.id));
+              return [...imported, ...nonSample.filter((p) => !existingIds.has(p.id))];
+            });
+            setSelectedMediaIds((prev) => {
+              const next = new Set(prev);
+              imported.forEach((i) => next.add(i.id));
+              return next;
+            });
+            setStatusMessage(
+              `Imported and analyzed ${imported.length} photo(s)/video(s) from Google Photos.`
+            );
+          } else {
+            setStatusMessage('Selection completed in Google Photos.');
+          }
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
       }
-      const res = await fetch(`/api/media/search?${params.toString()}`);
+    }, 3000);
+  }
+
+  async function handleGooglePhotosPicker() {
+    setStatusMessage('Opening Google Photos Picker...');
+    try {
+      const res = await fetch('/api/media/google-photos/picker-session', { method: 'POST' });
+      const data = await res.json();
+      if (data.configured && data.pickerUri && data.sessionId) {
+        window.open(data.pickerUri, '_blank');
+        startPickerPolling(data.sessionId);
+        setStatusMessage(
+          'Select your photos and videos in the Google Photos tab and click "Done" in the top-right corner. They will import here automatically.'
+        );
+      } else {
+        setShowSettingsModal(true);
+        setStatusMessage(
+          data.error ||
+            data.message ||
+            'Please click "Sign in with Google" to authorize Google Photos first.'
+        );
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  async function handleManualFetchFromGooglePicker() {
+    setIsImportingMedia(true);
+    setStatusMessage('Downloading and analyzing your selected items from Google Photos...');
+    try {
+      const url = activePickerSessionId
+        ? `/api/media/google-photos/import?session_id=${encodeURIComponent(activePickerSessionId)}`
+        : '/api/media/google-photos/import';
+      const res = await fetch(url, { method: 'POST' });
+      const imported: MediaItem[] = await res.json();
+      stopPickerPolling();
+      if (imported.length > 0) {
+        setMatchedMedia((prev) => {
+          const nonSample = prev.filter((p) => p.source !== 'sample');
+          const existingIds = new Set(imported.map((i) => i.id));
+          return [...imported, ...nonSample.filter((p) => !existingIds.has(p.id))];
+        });
+        setSelectedMediaIds((prev) => {
+          const next = new Set(prev);
+          imported.forEach((i) => next.add(i.id));
+          return next;
+        });
+        setStatusMessage(`Imported ${imported.length} item(s) from Google Photos!`);
+      } else {
+        setStatusMessage(
+          'No items returned yet. Make sure you clicked "Done" in the top-right corner of the Google Photos selection tab.'
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('Failed importing from Google Photos.');
+    } finally {
+      setIsImportingMedia(false);
+    }
+  }
+
+  async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    // Filter only supported image & video files when uploading a folder
+    const validFiles = Array.from(files).filter((f) => {
+      const ext = f.name.toLowerCase();
+      return (
+        f.type.startsWith('video/') ||
+        f.type.startsWith('image/') ||
+        ext.endsWith('.mp4') ||
+        ext.endsWith('.mov') ||
+        ext.endsWith('.jpg') ||
+        ext.endsWith('.jpeg') ||
+        ext.endsWith('.png') ||
+        ext.endsWith('.webp')
+      );
+    });
+
+    if (validFiles.length === 0) {
+      setStatusMessage('No supported photo or video files found in selection.');
+      return;
+    }
+
+    const formData = new FormData();
+    validFiles.forEach((f) => formData.append('files', f));
+    formData.append('query', 'dance event');
+
+    setIsImportingMedia(true);
+    setStatusMessage(
+      `Importing and analyzing dance movements on ${validFiles.length} file(s)...`
+    );
+    try {
+      const res = await fetch('/api/media/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      const uploaded: MediaItem[] = await res.json();
+      setMatchedMedia((prev) => {
+        const nonSample = prev.filter((p) => p.source !== 'sample');
+        const existingIds = new Set(uploaded.map((u) => u.id));
+        return [...uploaded, ...nonSample.filter((p) => !existingIds.has(p.id))];
+      });
+      setSelectedMediaIds((prev) => {
+        const next = new Set(prev);
+        uploaded.forEach((u) => next.add(u.id));
+        return next;
+      });
+      setStatusMessage(`Imported and analyzed ${uploaded.length} item(s).`);
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('Error uploading files.');
+    } finally {
+      setIsImportingMedia(false);
+      e.target.value = '';
+    }
+  }
+
+  async function handleLoadSampleMedia() {
+    setIsImportingMedia(true);
+    setStatusMessage('Loading demo dance event videos & photos...');
+    try {
+      const res = await fetch('/api/media/search?source=sample');
       const data: MediaItem[] = await res.json();
       setMatchedMedia(data);
       setSelectedMediaIds(new Set(data.map((m) => m.id)));
-      setStatusMessage(`Matched ${data.length} media items for "${searchQuery}".`);
+      setStatusMessage(`Loaded ${data.length} demo dance items.`);
     } catch (err) {
       console.error(err);
-      setStatusMessage('Error searching media.');
     } finally {
-      setIsSearchingMedia(false);
+      setIsImportingMedia(false);
     }
+  }
+
+  async function handleClearAllMedia() {
+    stopPickerPolling();
+    await fetch('/api/media/clear', { method: 'POST' });
+    setMatchedMedia([]);
+    setSelectedMediaIds(new Set());
+    setStatusMessage('Cleared imported media list.');
   }
 
   async function handleStartGoogleOAuthSignIn() {
@@ -215,54 +367,6 @@ export function App() {
     } catch (err) {
       console.error(err);
       setStatusMessage('Could not start Google OAuth flow.');
-    }
-  }
-
-  async function handleGooglePhotosPicker() {
-    setStatusMessage('Connecting to Google Photos Picker API...');
-    try {
-      const res = await fetch('/api/media/google-photos/picker-session', { method: 'POST' });
-      const data = await res.json();
-      if (data.configured && data.pickerUri) {
-        window.open(data.pickerUri, '_blank');
-        setStatusMessage('Google Photos Picker opened in a new tab. Select your items, then click Search Media.');
-      } else {
-        setShowSettingsModal(true);
-        setStatusMessage(
-          'Click "Sign in with Google" in the Settings dialog (or paste an OAuth token) to connect Google Photos.'
-        );
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  }
-
-  async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    const formData = new FormData();
-    Array.from(files).forEach((f) => formData.append('files', f));
-    formData.append('query', searchQuery);
-
-    setStatusMessage(`Uploading and analyzing ${files.length} file(s)...`);
-    try {
-      const res = await fetch('/api/media/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      const uploaded: MediaItem[] = await res.json();
-      setMatchedMedia((prev) => {
-        const existingIds = new Set(uploaded.map((u) => u.id));
-        return [...uploaded, ...prev.filter((p) => !existingIds.has(p.id))];
-      });
-      setSelectedMediaIds((prev) => {
-        const next = new Set(prev);
-        uploaded.forEach((u) => next.add(u.id));
-        return next;
-      });
-      setStatusMessage(`Uploaded and analyzed ${uploaded.length} item(s).`);
-    } catch (err) {
-      console.error(err);
     }
   }
 
@@ -336,15 +440,14 @@ export function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          search_query: searchQuery,
-          media_source: mediaSource,
-          local_folder_path: localFolderPath.trim() || null,
+          search_query: supplementalDirections || 'dance event',
+          media_source: 'auto',
           style_preset_id: selectedPresetId,
           supplemental_directions: supplementalDirections,
           music_track_id: selectedMusicId,
           music_generation_prompt: null,
           target_duration_sec: targetDurationSec,
-          selected_media_ids: Array.from(selectedMediaIds),
+          selected_media_ids: selectedMediaIds.size > 0 ? Array.from(selectedMediaIds) : null,
           auto_render_mp4: true,
           auto_export_capcut: true,
         }),
@@ -474,6 +577,12 @@ export function App() {
           </div>
 
           <div className="flex items-center gap-3">
+            {googlePhotosConnected && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                Google Photos Connected
+              </span>
+            )}
             <button
               onClick={() => setShowSettingsModal(true)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 transition"
@@ -531,14 +640,14 @@ export function App() {
 
         {statusMessage && (
           <div className="bg-slate-900 text-white px-6 py-2 text-xs">
-            <div className="max-w-6xl mx-auto flex items-center justify-between">
+            <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 <span>{statusMessage}</span>
               </div>
               <button
                 onClick={() => setStatusMessage(null)}
-                className="text-slate-400 hover:text-white text-[11px]"
+                className="text-slate-400 hover:text-white text-[11px] shrink-0"
               >
                 Dismiss
               </button>
@@ -550,7 +659,7 @@ export function App() {
       {/* Main Guided Workspace Container */}
       <main className="max-w-6xl w-full mx-auto px-6 py-8 flex-1">
         {/* ===================================================================
-            STEP 1: SOURCE MEDIA (GOOGLE PHOTOS / LOCAL QUERY / UPLOAD)
+            STEP 1: IMPORT MEDIA (GOOGLE PHOTOS OR LOCAL FOLDER / FILES)
            =================================================================== */}
         {currentStep === 1 && (
           <div className="space-y-6">
@@ -561,81 +670,111 @@ export function App() {
                     Step 1 of 4
                   </span>
                   <h2 className="text-lg font-semibold text-slate-900 mt-0.5">
-                    Find & Select Event Photos and Videos
+                    Import Event Photos & Videos
                   </h2>
                   <p className="text-sm text-slate-600 mt-0.5">
-                    Enter a search query to fetch media from Google Photos or your local library. Each video is automatically analyzed for jump peaks and turns.
+                    Choose how you want to bring in your daughter&apos;s dance event photos and videos. Imported clips are automatically analyzed for jump peaks and turns.
                   </p>
                 </div>
                 <button
                   onClick={() => setCurrentStep(2)}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0 transition"
+                  disabled={matchedMedia.length === 0}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-xs font-semibold shrink-0 transition"
                 >
                   Continue to Step 2: Style
                   <ChevronRight className="w-4 h-4" />
                 </button>
               </div>
 
-              {/* Search Input & Source Controls */}
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-5">
-                <div className="lg:col-span-8 space-y-3">
-                  <label className="block text-xs font-semibold text-slate-700">
-                    Photo & Video Search Query
-                  </label>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="e.g., daughter contemporary dance competition split leaps and turns"
-                      className="flex-1 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-900"
-                    />
-                    <button
-                      onClick={handleSearchMedia}
-                      disabled={isSearchingMedia}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0 disabled:opacity-50 transition"
-                    >
-                      <Search className="w-3.5 h-3.5" />
-                      {isSearchingMedia ? 'Searching...' : 'Search Media'}
-                    </button>
+              {/* Two Clean Primary Import Cards */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5 pt-6">
+                {/* Option 1: Google Photos */}
+                <div className="rounded-xl border border-slate-200 p-5 bg-slate-50/50 flex flex-col justify-between space-y-4">
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <div className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
+                        <ImageIcon className="w-4 h-4 text-slate-700" />
+                        Option A: Import from Google Photos
+                      </div>
+                      {googlePhotosConnected && (
+                        <span className="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded font-medium">
+                          Account Linked
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      Opens your Google Photos library where you can search or pick photos and videos from the dance event. When you click <b>Done</b> in Google Photos, your selection is automatically imported here.
+                    </p>
                   </div>
 
-                  {/* Example Query Suggestions */}
-                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                    <span className="text-xs text-slate-500 mr-1">Suggestions:</span>
-                    {[
-                      'Competition stage split leaps & turns',
-                      'Dance rehearsal studio triple pirouette',
-                      'Technique training firebird jumps & smiles',
-                    ].map((q) => (
-                      <button
-                        key={q}
-                        onClick={() => setSearchQuery(q)}
-                        className="text-xs px-2.5 py-1 rounded-md bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
-                      >
-                        {q}
-                      </button>
-                    ))}
+                  <div className="space-y-2 pt-2">
+                    <button
+                      onClick={handleGooglePhotosPicker}
+                      disabled={isImportingMedia}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition cursor-pointer"
+                    >
+                      <ImageIcon className="w-4 h-4" />
+                      {isWaitingForGooglePicker
+                        ? 'Re-open Google Photos Picker'
+                        : 'Select from Google Photos'}
+                    </button>
+
+                    {(isWaitingForGooglePicker || activePickerSessionId) && (
+                      <div className="p-3 rounded-lg bg-white border border-slate-200 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-xs text-slate-700">
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 text-slate-600 shrink-0 ${
+                              isWaitingForGooglePicker || isImportingMedia ? 'animate-spin' : ''
+                            }`}
+                          />
+                          <span>
+                            {isWaitingForGooglePicker
+                              ? 'Waiting for you to click "Done" in Google Photos...'
+                              : 'Finished selecting in Google Photos?'}
+                          </span>
+                        </div>
+                        <button
+                          onClick={handleManualFetchFromGooglePicker}
+                          disabled={isImportingMedia}
+                          className="px-3 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0"
+                        >
+                          {isImportingMedia ? 'Importing...' : 'Import Selected Now'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
 
-                {/* Right side: Google Photos Picker, Upload, Local Folder */}
-                <div className="lg:col-span-4 space-y-2.5 lg:border-l lg:border-slate-100 lg:pl-4">
-                  <label className="block text-xs font-semibold text-slate-700">
-                    Media Sources
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={handleGooglePhotosPicker}
-                      className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 transition"
-                    >
-                      <ImageIcon className="w-3.5 h-3.5 text-slate-600" />
-                      Google Photos
-                    </button>
+                {/* Option 2: Upload Folder or Files from Computer */}
+                <div className="rounded-xl border border-slate-200 p-5 bg-slate-50/50 flex flex-col justify-between space-y-4">
+                  <div className="space-y-1.5">
+                    <div className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
+                      <FolderOpen className="w-4 h-4 text-slate-700" />
+                      Option B: Upload from a Local Folder
+                    </div>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      Select an entire folder of event photos/videos from your Mac, or pick individual `.mp4`, `.mov`, and `.jpg`/`.png` files directly from Finder.
+                    </p>
+                  </div>
 
-                    <label className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 transition cursor-pointer">
-                      <Upload className="w-3.5 h-3.5 text-slate-600" />
-                      Upload Files
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2">
+                    <label className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition cursor-pointer">
+                      <FolderOpen className="w-4 h-4" />
+                      Upload Entire Folder
+                      <input
+                        type="file"
+                        multiple
+                        // @ts-expect-error webkitdirectory is standard in modern browsers for folder selection
+                        webkitdirectory=""
+                        directory=""
+                        onChange={handleMediaUpload}
+                        className="hidden"
+                      />
+                    </label>
+
+                    <label className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold transition cursor-pointer">
+                      <Upload className="w-4 h-4" />
+                      Select Individual Files
                       <input
                         type="file"
                         multiple
@@ -645,57 +784,96 @@ export function App() {
                       />
                     </label>
                   </div>
-
-                  <div className="flex items-center gap-2">
-                    <FolderOpen className="w-4 h-4 text-slate-400 shrink-0" />
-                    <input
-                      type="text"
-                      value={localFolderPath}
-                      onChange={(e) => setLocalFolderPath(e.target.value)}
-                      placeholder="Optional local directory (e.g., ~/Pictures/Dance)"
-                      className="w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-700 focus:outline-none focus:bg-white focus:border-slate-400"
-                    />
-                  </div>
                 </div>
               </div>
             </div>
 
-            {/* Matched Media Grid with Detected Kinematics */}
+            {/* Imported Media List */}
             <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
-              <div className="flex items-center justify-between mb-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
                 <div>
                   <h3 className="text-sm font-semibold text-slate-900">
-                    Matched Event Media ({selectedMediaIds.size} of {matchedMedia.length} selected)
+                    Imported Session Media ({selectedMediaIds.size} selected)
                   </h3>
                   <p className="text-xs text-slate-500">
-                    Videos show detected Jump Peaks and Turn timestamps used for beat-syncing. Click any card to include or exclude it.
+                    Videos show detected Jump Peaks and Turn timestamps used for beat-syncing in Step 3.
                   </p>
                 </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setSelectedMediaIds(new Set(matchedMedia.map((m) => m.id)))}
-                    className="text-xs px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50 text-slate-600"
-                  >
-                    Select All
-                  </button>
+
+                <div className="flex items-center gap-2">
+                  {matchedMedia.length === 0 ? (
+                    <button
+                      onClick={handleLoadSampleMedia}
+                      className="text-xs px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 font-medium"
+                    >
+                      Load Demo Dance Media (For Testing)
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => setSelectedMediaIds(new Set(matchedMedia.map((m) => m.id)))}
+                        className="text-xs px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50 text-slate-600"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        onClick={handleClearAllMedia}
+                        className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded border border-slate-200 hover:bg-red-50 hover:text-red-700 hover:border-red-200 text-slate-600 transition"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        Clear List
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {matchedMedia.map((item) => {
-                  const isChecked = selectedMediaIds.has(item.id);
-                  return (
-                    <div
-                      key={item.id}
-                      onClick={() => toggleMediaSelection(item.id)}
-                      className={`p-3.5 rounded-lg border text-left cursor-pointer transition flex flex-col justify-between gap-3 ${
-                        isChecked
-                          ? 'border-slate-900 bg-slate-50/60'
-                          : 'border-slate-200 bg-white opacity-60 hover:opacity-100'
-                      }`}
-                    >
-                      <div>
-                        <div className="flex items-start justify-between gap-2">
+              {matchedMedia.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-slate-200 p-10 text-center space-y-2">
+                  <p className="text-sm font-medium text-slate-700">
+                    No photos or videos imported yet
+                  </p>
+                  <p className="text-xs text-slate-500 max-w-md mx-auto">
+                    Use <b>Option A (Import from Google Photos)</b> or <b>Option B (Upload from a Local Folder)</b> above to import media for this session.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                  {matchedMedia.map((item) => {
+                    const isChecked = selectedMediaIds.has(item.id);
+                    return (
+                      <div
+                        key={item.id}
+                        onClick={() => toggleMediaSelection(item.id)}
+                        className={`rounded-lg border overflow-hidden text-left cursor-pointer transition flex flex-col justify-between ${
+                          isChecked
+                            ? 'border-slate-900 bg-slate-50/60'
+                            : 'border-slate-200 bg-white opacity-60 hover:opacity-100'
+                        }`}
+                      >
+                        {/* Thumbnail / Video Preview */}
+                        <div className="h-36 bg-slate-900 flex items-center justify-center overflow-hidden relative">
+                          {item.media_type === 'photo' ? (
+                            <img
+                              src={item.url}
+                              alt={item.filename}
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <video
+                              src={item.url}
+                              muted
+                              playsInline
+                              preload="metadata"
+                              className="w-full h-full object-cover"
+                            />
+                          )}
+                          <span className="absolute top-2 right-2 text-[10px] font-semibold px-2 py-0.5 rounded bg-slate-900/80 text-white uppercase">
+                            {item.media_type}
+                          </span>
+                        </div>
+
+                        <div className="p-3 flex-1 flex flex-col justify-between gap-2">
                           <div className="flex items-center gap-2 min-w-0">
                             <input
                               type="checkbox"
@@ -707,41 +885,32 @@ export function App() {
                               {item.filename}
                             </span>
                           </div>
-                          <span className="text-[11px] font-medium px-2 py-0.5 rounded bg-slate-100 text-slate-700 shrink-0 uppercase">
-                            {item.media_type}
-                          </span>
-                        </div>
-                        <p className="text-xs text-slate-600 mt-1.5 line-clamp-2">
-                          {item.semantic_caption}
-                        </p>
-                      </div>
 
-                      <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                        {item.media_type === 'video' ? (
-                          <div className="flex flex-wrap gap-1">
-                            {item.dance_events.map((ev, i) => (
-                              <span
-                                key={i}
-                                className="px-2 py-0.5 rounded bg-slate-200/80 text-slate-800 font-medium"
-                              >
-                                {ev.move_type === 'jump_peak' ? 'Jump Peak' : 'Turn Peak'} @{' '}
-                                {ev.timestamp_sec.toFixed(2)}s
+                          <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-1 text-[11px]">
+                            {item.media_type === 'video' ? (
+                              <div className="flex flex-wrap gap-1">
+                                {item.dance_events.map((ev, i) => (
+                                  <span
+                                    key={i}
+                                    className="px-2 py-0.5 rounded bg-slate-200/80 text-slate-800 font-medium"
+                                  >
+                                    {ev.move_type === 'jump_peak' ? 'Jump Peak' : 'Turn Peak'} @{' '}
+                                    {ev.timestamp_sec.toFixed(2)}s
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-medium">
+                                Still Photo • Quality {Math.round(item.aesthetic_score * 100)}%
                               </span>
-                            ))}
+                            )}
                           </div>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-medium">
-                            Still Photo • Quality {Math.round(item.aesthetic_score * 100)}%
-                          </span>
-                        )}
-                        <span className="text-slate-400 font-mono">
-                          {Math.round(item.query_match_score * 100)}% match
-                        </span>
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -828,7 +997,10 @@ export function App() {
                               : 'border-slate-100 text-slate-500'
                           }`}
                         >
-                          <span>{Math.round(preset.video_to_photo_ratio * 100)}% Video / {Math.round((1 - preset.video_to_photo_ratio) * 100)}% Photo</span>
+                          <span>
+                            {Math.round(preset.video_to_photo_ratio * 100)}% Video /{' '}
+                            {Math.round((1 - preset.video_to_photo_ratio) * 100)}% Photo
+                          </span>
                           <span className="capitalize">{preset.cut_pacing.replace('_', ' ')}</span>
                         </div>
                       </button>
@@ -872,7 +1044,10 @@ export function App() {
                   <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600 space-y-1">
                     <div className="font-semibold text-slate-800">Preset Summary</div>
                     <div>• Style: {activePreset?.name}</div>
-                    <div>• Speed Ramp on Jump/Turn Apex: {activePreset?.speed_ramp_on_peaks ? 'Enabled' : 'Standard 1.0x'}</div>
+                    <div>
+                      • Speed Ramp on Jump/Turn Apex:{' '}
+                      {activePreset?.speed_ramp_on_peaks ? 'Enabled' : 'Standard 1.0x'}
+                    </div>
                     <div>• Color Grade: {activePreset?.color_grade_preset.replace('_', ' ')}</div>
                   </div>
                 </div>
@@ -1173,7 +1348,7 @@ export function App() {
                       />
                     ) : (
                       <div className="text-xs text-slate-400 p-6 text-center">
-                        Rendering video preview...
+                        Click &quot;Generate Reel &amp; Post&quot; in Step 3 to render your video.
                       </div>
                     )}
                   </div>
@@ -1548,13 +1723,13 @@ export function App() {
 
                 <div>
                   <label className="block text-[11px] font-medium text-slate-600 mb-0.5">
-                    Google OAuth Client Secret (Optional for Desktop App / Required for Web App Client)
+                    Google OAuth Client Secret (Configured)
                   </label>
                   <input
                     type="password"
                     value={googleClientSecretInput}
                     onChange={(e) => setGoogleClientSecretInput(e.target.value)}
-                    placeholder="GOCSPX-..."
+                    placeholder="Leave blank to keep existing secret..."
                     className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900"
                   />
                 </div>
