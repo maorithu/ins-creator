@@ -22,11 +22,28 @@ An automated workflow & interactive studio for creating beat-synced Instagram Re
    - Renders ready-to-post 9:16 vertical MP4 videos (`mp4_renderer.py`).
    - Exports and auto-installs editable **CapCut Desktop Drafts** (`draft_content.json` + `draft_meta_info.json` in `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/`) and **FCPXML** timelines (`fcpxml_exporter.py`).
 
-## Quick Start
+## Quick Start (fresh machine)
+Prerequisites: **macOS**, **Python 3.9+**, **Node.js 18+**, and **git**.
+
 ```bash
-./scripts/start.sh
+git clone https://github.com/maorithu/ins-creator.git
+cd ins-creator
+cp .env.example .env        # then edit .env (see below)
+./scripts/start.sh          # creates the venv, installs deps, builds the UI, starts the server
 ```
-Then open **http://127.0.0.1:8000** in your browser.
+Then open **http://127.0.0.1:8000** (use `127.0.0.1`, not `localhost` — Google OAuth redirects there).
+
+### Configuration (`.env`)
+| Variable | Needed for | Notes |
+|---|---|---|
+| `GEMINI_API_KEY` | AI captions, hooks, photo descriptions | From https://aistudio.google.com/apikey |
+| `GEMINI_MODEL` | optional | Defaults to `gemini-3.8-flash` |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google Photos import | OAuth client in Google Cloud Console; redirect URI `http://127.0.0.1:8000/api/auth/google/callback`; your Google account must be listed as a **Test user** on the OAuth consent screen |
+| `ELEVENLABS_API_KEY` | optional cloud music generation | Otherwise a local synthesizer is used |
+
+After starting, click **Sign in with Google** once on each machine — the OAuth tokens are stored locally in `data/google_oauth_tokens.json` (not in git).
+
+> `data/` (imported media, uploaded music, sessions, exports, OAuth tokens) and `.env` are git-ignored, so each laptop has its own copy.
 
 ## Running Tests
 ```bash
