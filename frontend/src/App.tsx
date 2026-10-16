@@ -95,6 +95,8 @@ export function App() {
   const [timelineClips, setTimelineClips] = useState<TimelineClip[]>([]);
   const [postCopy, setPostCopy] = useState<InstagramPostCopy | null>(null);
   const [selectedCaptionVariantIdx, setSelectedCaptionVariantIdx] = useState<number>(-1);
+  const [postCopyPrompt, setPostCopyPrompt] = useState<string>('');
+  const [isRegeneratingPostCopy, setIsRegeneratingPostCopy] = useState<boolean>(false);
 
   // UI status state
   const [isGeneratingSession, setIsGeneratingSession] = useState(false);
@@ -547,6 +549,43 @@ export function App() {
       console.error(err);
     } finally {
       setIsUpdatingTimeline(false);
+    }
+  }
+
+  async function handleRegeneratePostCopy(promptOverride?: string) {
+    if (!session) return;
+    const promptToUse = promptOverride !== undefined ? promptOverride : postCopyPrompt;
+    if (promptOverride !== undefined) {
+      setPostCopyPrompt(promptOverride);
+    }
+    setIsRegeneratingPostCopy(true);
+    setStatusMessage(
+      promptToUse.trim()
+        ? `Regenerating personalized post copy with prompt: "${promptToUse.trim()}"...`
+        : 'Regenerating personalized post copy from media metadata...'
+    );
+    try {
+      const res = await fetch(`/api/sessions/${session.session_id}/post-copy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          custom_prompt: promptToUse,
+        }),
+      });
+      if (!res.ok) {
+        setStatusMessage('Failed to regenerate post copy.');
+        return;
+      }
+      const updated: WorkflowSession = await res.json();
+      setSession(updated);
+      setTimelineClips(updated.timeline_clips);
+      setPostCopy(updated.post_copy || null);
+      setStatusMessage('Personalized Instagram post titles, captions, and hashtags updated.');
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('Error regenerating post copy.');
+    } finally {
+      setIsRegeneratingPostCopy(false);
     }
   }
 
@@ -1701,14 +1740,14 @@ export function App() {
                 {/* Attractive Instagram Post Titles, Captions & Hashtags */}
                 {postCopy && (
                   <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                       <div>
                         <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
                           <FileText className="w-4 h-4 text-slate-700" />
-                          Instagram Post Titles & Caption
+                          Personalized Instagram Post Titles & Caption
                         </h3>
                         <p className="text-xs text-slate-500">
-                          Generated for your event and supplemental directions. Edit any field or switch caption tones below.
+                          Grounded in your imported media metadata (dancer/routine filenames, styles, dates & camera context).
                         </p>
                       </div>
                       <button
@@ -1718,7 +1757,7 @@ export function App() {
                             `${postCopy.post_headline}\n\n${displayedCaption}\n\n${postCopy.hashtags.join(' ')}`
                           )
                         }
-                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shrink-0 transition"
                       >
                         {copiedField === 'all_post' ? (
                           <>
@@ -1730,6 +1769,84 @@ export function App() {
                           </>
                         )}
                       </button>
+                    </div>
+
+                    {/* Personalized Media Metadata Context Used */}
+                    {session && session.matched_media.length > 0 && (
+                      <div className="p-3 rounded-lg bg-slate-50 border border-slate-200/80 space-y-1.5">
+                        <div className="text-[11px] font-semibold text-slate-700">
+                          Media Context Linked to This Post ({session.matched_media.length} items):
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {session.matched_media.slice(0, 6).map((m) => (
+                            <span
+                              key={m.id}
+                              className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700"
+                            >
+                              <b className="text-slate-900">{m.filename}</b>
+                              {m.tags.length > 0 && (
+                                <span className="text-slate-500">
+                                  ({m.tags.slice(0, 2).join(', ')})
+                                </span>
+                              )}
+                              {m.creation_time && (
+                                <span className="text-slate-400">• {m.creation_time.split(' ')[0]}</span>
+                              )}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Regenerate Post Copy with Custom Prompt */}
+                    <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+                      <label className="block text-xs font-semibold text-slate-800">
+                        Regenerate Post Content with Custom Prompt
+                      </label>
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <input
+                          type="text"
+                          value={postCopyPrompt}
+                          onChange={(e) => setPostCopyPrompt(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              void handleRegeneratePostCopy();
+                            }
+                          }}
+                          placeholder="e.g., Mention Lillian's contemporary solo 'In The Current', thank her choreographer, or make it short & witty..."
+                          className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 focus:outline-none focus:border-slate-900"
+                        />
+                        <button
+                          onClick={() => void handleRegeneratePostCopy()}
+                          disabled={isRegeneratingPostCopy}
+                          className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold shrink-0 transition cursor-pointer"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${isRegeneratingPostCopy ? 'animate-spin' : ''}`}
+                          />
+                          {isRegeneratingPostCopy ? 'Regenerating...' : 'Regenerate Post'}
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                        <span className="text-[10px] font-medium text-slate-500">Quick prompts:</span>
+                        {[
+                          "Highlight Lillian's contemporary solo 'In The Current' & stage poise",
+                          'Short & punchy hype caption for Instagram Reels',
+                          'Thank her dance teacher, choreographer & studio family',
+                          'Playful & funny dance parent perspective',
+                          'Bilingual English + 中文 stage storytelling',
+                        ].map((presetPrompt) => (
+                          <button
+                            key={presetPrompt}
+                            type="button"
+                            onClick={() => void handleRegeneratePostCopy(presetPrompt)}
+                            disabled={isRegeneratingPostCopy}
+                            className="text-[10px] px-2 py-0.5 rounded-full border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 transition cursor-pointer"
+                          >
+                            {presetPrompt}
+                          </button>
+                        ))}
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1795,7 +1912,7 @@ export function App() {
                       </div>
 
                       <textarea
-                        rows={5}
+                        rows={6}
                         value={displayedCaption}
                         onChange={(e) => {
                           if (selectedCaptionVariantIdx === -1) {
@@ -1815,7 +1932,7 @@ export function App() {
 
                     <div>
                       <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                        Tags & Hashtags
+                        Personalized Tags & Hashtags
                       </label>
                       <div className="flex flex-wrap gap-1.5">
                         {postCopy.hashtags.map((tag) => (

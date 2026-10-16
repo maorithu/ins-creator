@@ -609,6 +609,39 @@ def trigger_capcut_export(session_id: str) -> WorkflowSession:
     return session
 
 
+class RegeneratePostCopyPayload(BaseModel):
+    custom_prompt: str = ""
+
+
+@app.post("/api/sessions/{session_id}/post-copy", response_model=WorkflowSession)
+def regenerate_session_post_copy(
+    session_id: str, payload: RegeneratePostCopyPayload
+) -> WorkflowSession:
+    """Regenerates personalized Instagram post titles, captions, and hashtags grounded in the session's media and a custom prompt."""
+    session = _load_session(session_id)
+    base_preset = get_preset_by_id(session.style_preset_id)
+    active_preset = apply_supplemental_directions_to_preset(
+        base_preset, session.supplemental_directions
+    )
+    new_copy = generate_instagram_post_copy(
+        search_query=session.search_query,
+        style_preset=active_preset,
+        supplemental_directions=session.supplemental_directions,
+        matched_media=session.matched_media,
+        timeline_clips=session.timeline_clips,
+        audio_cue_map=session.audio_cue_map,
+        custom_prompt=payload.custom_prompt,
+    )
+    session.post_copy = new_copy
+    if session.timeline_clips:
+        session.timeline_clips[0].text_overlay = new_copy.hook_title_overlay
+        if len(session.timeline_clips) > 1:
+            session.timeline_clips[-1].text_overlay = new_copy.ending_call_to_action
+    _save_session(session)
+    return session
+
+
+
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend_assets")
