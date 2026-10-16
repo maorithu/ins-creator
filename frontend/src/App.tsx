@@ -148,13 +148,25 @@ export function App() {
       setMusicTracks(mData);
 
       // Check if user already has imported Google Photos or uploaded local files from a recent session
-      const mediaRes = await fetch('/api/media/search?source=google_photos');
+      const [mediaRes, sessRes] = await Promise.all([
+        fetch('/api/media/search?source=google_photos'),
+        fetch('/api/sessions'),
+      ]);
       if (mediaRes.ok) {
         const mediaData: MediaItem[] = await mediaRes.json();
         const userOnly = mediaData.filter((m) => m.source !== 'sample');
         if (userOnly.length > 0) {
           setMatchedMedia(userOnly);
           setSelectedMediaIds(new Set(userOnly.map((m) => m.id)));
+        }
+      }
+      if (sessRes.ok) {
+        const sessList: WorkflowSession[] = await sessRes.json();
+        if (sessList.length > 0) {
+          const latest = sessList[0];
+          setSession(latest);
+          setTimelineClips(latest.timeline_clips);
+          setPostCopy(latest.post_copy || null);
         }
       }
     } catch (err) {
