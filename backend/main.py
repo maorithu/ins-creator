@@ -346,6 +346,16 @@ def clear_imported_and_uploaded_media() -> Dict[str, object]:
     return {"status": "cleared"}
 
 
+@app.post("/api/media/reanalyze", response_model=List[MediaItem])
+def reanalyze_imported_media() -> List[MediaItem]:
+    """Clears in-memory analysis cache and re-extracts EXIF, CV kinematics, sharpness/quality, and AI metadata tags."""
+    from backend.services.media_ingest import _ANALYZED_MEDIA_CACHE
+
+    _ANALYZED_MEDIA_CACHE.clear()
+    return search_and_ingest_media(query="dance event", media_source="auto")
+
+
+
 @app.post("/api/media/upload", response_model=List[MediaItem])
 async def upload_media_files(
     files: List[UploadFile] = File(...),

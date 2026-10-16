@@ -25,6 +25,8 @@ export interface MediaItem {
   width: number;
   height: number;
   duration_sec: number;
+  creation_time?: string | null;
+  camera_model?: string | null;
   event_category: string;
   tags: string[];
   semantic_caption: string;

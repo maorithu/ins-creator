@@ -59,7 +59,10 @@ def test_ai_custom_music_generation() -> None:
 def test_media_search_and_dance_kinematics() -> None:
     r = client.get(
         "/api/media/search",
-        params={"query": "daughter contemporary competition split leap and pirouette turns"},
+        params={
+            "query": "daughter contemporary competition split leap and pirouette turns",
+            "source": "sample",
+        },
     )
     assert r.status_code == 200
     items = r.json()
@@ -84,7 +87,7 @@ def test_end_to_end_session_generation_and_exports() -> None:
         "/api/sessions/generate",
         json={
             "search_query": "daughter dance competition split leap and rehearsal turns",
-            "media_source": "auto",
+            "media_source": "sample",
             "style_preset_id": "competition_stage_glory",
             "supplemental_directions": (
                 "Sync her highest jump peak to the main downbeat, insert a graceful stage photo "

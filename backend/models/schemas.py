@@ -77,6 +77,7 @@ class MediaItem(BaseModel):
     height: int = 1920
     duration_sec: float = 0.0
     creation_time: Optional[str] = None
+    camera_model: Optional[str] = None
     event_category: EventCategory = EventCategory.GENERAL
     tags: List[str] = Field(default_factory=list)
     semantic_caption: str = ""

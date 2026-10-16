@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -75,8 +75,144 @@ def detect_subject_focal_box(bgr_frame: np.ndarray) -> BoundingBoxCenter:
     )
 
 
+def _extract_exif_and_enrich_metadata(item: MediaItem, bgr_frame: Optional[np.ndarray] = None) -> MediaItem:
+    """
+    Extracts EXIF metadata (Capture Date/Time, Camera Make/Model) using Pillow,
+    parses human-readable dance context from filenames (e.g. '093LillianWeiInTheCurrentCont12903.JPG'),
+    and optionally enriches with Gemini Vision when configured.
+    """
+    import re
+    from PIL import Image, ExifTags
+    from backend.config import settings
+    from backend.models.schemas import EventCategory
+
+    path = Path(item.filepath)
+    if path.exists() and item.media_type == MediaType.PHOTO:
+        try:
+            with Image.open(path) as pil_img:
+                exif = pil_img.getexif()
+                if exif:
+                    decoded = {ExifTags.TAGS.get(k, k): v for k, v in exif.items() if k in ExifTags.TAGS}
+                    make = str(decoded.get("Make") or "").strip()
+                    model = str(decoded.get("Model") or "").strip()
+                    if model:
+                        if make and not model.lower().startswith(make.lower()):
+                            item.camera_model = f"{make} {model}"
+                        else:
+                            item.camera_model = model
+                    dt_raw = str(decoded.get("DateTimeOriginal") or decoded.get("DateTime") or "").strip()
+                    if dt_raw and not item.creation_time:
+                        # Convert '2026:03:26 11:45:38' -> '2026-03-26 11:45'
+                        parts = dt_raw.split(" ")
+                        date_part = parts[0].replace(":", "-")
+                        time_part = parts[1][:5] if len(parts) > 1 else ""
+                        item.creation_time = f"{date_part} {time_part}".strip()
+        except Exception:
+            pass
+
+    # Parse intelligent dance tags & caption from filename + visual properties
+    stem = Path(item.filename).stem
+    # Split camelCase like '093LillianWeiInTheCurrentCont12903' -> 'Lillian Wei In The Current Cont'
+    words = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
+    words = re.sub(r"[0-9_]+", " ", words).strip()
+
+    inferred_tags = list(dict.fromkeys(item.tags))
+    lower_name = f"{item.filename} {words}".lower()
+
+    if "cont" in lower_name or "contemporary" in lower_name:
+        inferred_tags.append("Contemporary")
+        item.event_category = EventCategory.COMPETITION
+    if "lyrical" in lower_name:
+        inferred_tags.append("Lyrical")
+    if "ballet" in lower_name or "arabesque" in lower_name:
+        inferred_tags.append("Ballet")
+    if "rehearsal" in lower_name or "studio" in lower_name:
+        inferred_tags.append("Rehearsal")
+        item.event_category = EventCategory.REHEARSAL
+    if "training" in lower_name or "acro" in lower_name:
+        inferred_tags.append("Training")
+        item.event_category = EventCategory.TRAINING
+    if "comp" in lower_name or "stage" in lower_name or "current" in lower_name:
+        if "Stage" not in inferred_tags:
+            inferred_tags.append("Stage Performance")
+        item.event_category = EventCategory.COMPETITION
+
+    aspect_label = "Portrait" if item.height >= item.width else "Landscape Stage"
+    if aspect_label not in inferred_tags:
+        inferred_tags.append(aspect_label)
+
+    if item.camera_model and "Canon" in item.camera_model and "Pro DSLR" not in inferred_tags:
+        inferred_tags.append("Pro Stage Photo")
+    elif item.camera_model and "iPhone" in item.camera_model and "Mobile Capture" not in inferred_tags:
+        inferred_tags.append("Candid / Mobile")
+
+    # Try Gemini Vision analysis if API key is configured (AIza...) and caption is generic
+    used_gemini = False
+    if (
+        settings.gemini_api_key
+        and settings.gemini_api_key.startswith("AIza")
+        and getattr(_extract_exif_and_enrich_metadata, "_gemini_ok", True)
+        and (
+            not item.semantic_caption
+            or item.semantic_caption.startswith("Imported from")
+            or item.semantic_caption.startswith("Dance media")
+        )
+    ):
+        try:
+            from google import genai
+            from PIL import Image
+
+            if path.exists() and item.media_type == MediaType.PHOTO:
+                client = genai.Client(api_key=settings.gemini_api_key)
+                with Image.open(path) as img_for_ai:
+                    img_copy = img_for_ai.copy()
+                    img_copy.thumbnail((768, 768))
+                    resp = client.models.generate_content(
+                        model=settings.gemini_model,
+                        contents=[
+                            img_copy,
+                            "Describe this dance event photo in one concise sentence (max 18 words) focusing on pose, lighting, or setting, and list 3 short tags separated by commas after a pipe '|'. Example: Poised contemporary floor reach under blue stage lights | Contemporary, Stage Lighting, Extension",
+                        ],
+                    )
+                    txt = (resp.text or "").strip()
+                    if txt:
+                        parts = txt.split("|")
+                        item.semantic_caption = parts[0].strip()
+                        if len(parts) > 1:
+                            for tg in parts[1].split(","):
+                                clean_tg = tg.strip()
+                                if clean_tg and clean_tg not in inferred_tags:
+                                    inferred_tags.append(clean_tg)
+                        used_gemini = True
+        except Exception:
+            setattr(_extract_exif_and_enrich_metadata, "_gemini_ok", False)
+
+
+    if not used_gemini and (
+        not item.semantic_caption
+        or item.semantic_caption.startswith("Imported from")
+        or item.semantic_caption.startswith("Dance media")
+    ):
+        # Generate rich descriptive metadata summary based on visual analysis, EXIF, and parsed filename
+        cam_note = f" captured on {item.camera_model}" if item.camera_model else ""
+        if len(words) > 4 and not words.lower().startswith("img") and not words.lower().startswith("gp"):
+            item.semantic_caption = (
+                f"{aspect_label} performance photograph ('{words}'){cam_note} — "
+                f"sharpness {int(item.sharpness_score * 100)}%, focal center ({item.focal_point.center_x:.2f}, {item.focal_point.center_y:.2f})."
+            )
+        else:
+            lighting_desc = "warm high-key lighting" if item.aesthetic_score >= 0.75 else "stage spotlight contrast"
+            item.semantic_caption = (
+                f"{aspect_label} dance event capture{cam_note} with {lighting_desc} — "
+                f"focal subject at ({item.focal_point.center_x:.2f}, {item.focal_point.center_y:.2f})."
+            )
+
+    item.tags = [t for t in inferred_tags if t not in ("google_photos", "local", "dance", "photo", "video")][:5]
+    return item
+
+
 def analyze_photo_item(item: MediaItem) -> MediaItem:
-    """Populates sharpness, aesthetic score, dimensions, and focal point for a photo."""
+    """Populates sharpness, aesthetic score, dimensions, focal point, EXIF metadata, and AI/CV tags for a photo."""
     path = Path(item.filepath)
     if not path.exists():
         return item
@@ -91,6 +227,7 @@ def analyze_photo_item(item: MediaItem) -> MediaItem:
     item.sharpness_score = compute_sharpness_score(img)
     item.aesthetic_score = compute_aesthetic_score(img, item.sharpness_score)
     item.focal_point = detect_subject_focal_box(img)
+    item = _extract_exif_and_enrich_metadata(item, img)
     return item
 
 
@@ -323,4 +460,6 @@ def analyze_video_dance_kinematics(item: MediaItem) -> MediaItem:
 
     events.sort(key=lambda e: e.timestamp_sec)
     item.dance_events = events
+    item = _extract_exif_and_enrich_metadata(item, mid_frame_bgr)
     return item
+

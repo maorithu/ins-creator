@@ -360,6 +360,22 @@ export function App() {
     setStatusMessage('Cleared imported media list.');
   }
 
+  async function handleReanalyzeMedia() {
+    setIsImportingMedia(true);
+    setStatusMessage('Analyzing media EXIF, quality, focal points, and dance metadata...');
+    try {
+      const res = await fetch('/api/media/reanalyze', { method: 'POST' });
+      const data: MediaItem[] = await res.json();
+      setMatchedMedia(data);
+      setStatusMessage(`Analyzed and applied metadata to ${data.length} media item(s).`);
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('Failed to re-analyze media metadata.');
+    } finally {
+      setIsImportingMedia(false);
+    }
+  }
+
   async function handleStartGoogleOAuthSignIn() {
     try {
       await fetch('/api/config', {
@@ -805,10 +821,10 @@ export function App() {
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
                 <div>
                   <h3 className="text-sm font-semibold text-slate-900">
-                    Imported Session Media ({selectedMediaIds.size} selected)
+                    Imported Session Media ({selectedMediaIds.size} of {matchedMedia.length} selected)
                   </h3>
                   <p className="text-xs text-slate-500">
-                    Videos show detected Jump Peaks and Turn timestamps used for beat-syncing in Step 3.
+                    Each imported photo or video is analyzed for EXIF camera/date metadata, focal subject framing, sharpness, and dance peaks.
                   </p>
                 </div>
 
@@ -822,6 +838,14 @@ export function App() {
                     </button>
                   ) : (
                     <>
+                      <button
+                        onClick={handleReanalyzeMedia}
+                        disabled={isImportingMedia}
+                        className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50 text-slate-700 font-medium transition"
+                      >
+                        <RefreshCw className={`w-3 h-3 ${isImportingMedia ? 'animate-spin' : ''}`} />
+                        Re-Analyze Metadata
+                      </button>
                       <button
                         onClick={() => setSelectedMediaIds(new Set(matchedMedia.map((m) => m.id)))}
                         className="text-xs px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50 text-slate-600"
@@ -850,21 +874,21 @@ export function App() {
                   </p>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {matchedMedia.map((item) => {
                     const isChecked = selectedMediaIds.has(item.id);
                     return (
                       <div
                         key={item.id}
                         onClick={() => toggleMediaSelection(item.id)}
-                        className={`rounded-lg border overflow-hidden text-left cursor-pointer transition flex flex-col justify-between ${
+                        className={`rounded-xl border overflow-hidden text-left cursor-pointer transition flex flex-col justify-between ${
                           isChecked
-                            ? 'border-slate-900 bg-slate-50/60'
+                            ? 'border-slate-900 bg-slate-50/40 shadow-sm'
                             : 'border-slate-200 bg-white opacity-60 hover:opacity-100'
                         }`}
                       >
                         {/* Thumbnail / Video Preview */}
-                        <div className="h-36 bg-slate-900 flex items-center justify-center overflow-hidden relative">
+                        <div className="h-44 bg-slate-900 flex items-center justify-center overflow-hidden relative">
                           {item.media_type === 'photo' ? (
                             <img
                               src={item.url}
@@ -880,41 +904,103 @@ export function App() {
                               className="w-full h-full object-cover"
                             />
                           )}
-                          <span className="absolute top-2 right-2 text-[10px] font-semibold px-2 py-0.5 rounded bg-slate-900/80 text-white uppercase">
-                            {item.media_type}
+                          <div className="absolute top-2 left-2 flex items-center gap-1.5">
+                            <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-slate-900/80 text-white uppercase">
+                              {item.media_type}
+                            </span>
+                            {item.event_category && item.event_category !== 'general' && (
+                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-white/90 text-slate-900 capitalize">
+                                {item.event_category}
+                              </span>
+                            )}
+                          </div>
+                          <span className="absolute top-2 right-2 text-[10px] font-medium px-2 py-0.5 rounded bg-slate-900/80 text-slate-100">
+                            {item.width}×{item.height}
+                            {item.media_type === 'video' ? ` • ${item.duration_sec.toFixed(1)}s` : ''}
                           </span>
                         </div>
 
-                        <div className="p-3 flex-1 flex flex-col justify-between gap-2">
-                          <div className="flex items-center gap-2 min-w-0">
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => {}}
-                              className="rounded border-slate-300 text-slate-900 focus:ring-slate-900"
-                            />
-                            <span className="text-xs font-semibold text-slate-900 truncate">
-                              {item.filename}
-                            </span>
+                        <div className="p-3.5 flex-1 flex flex-col justify-between gap-2.5">
+                          <div className="space-y-1.5">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => {}}
+                                className="rounded border-slate-300 text-slate-900 focus:ring-slate-900 shrink-0"
+                              />
+                              <span
+                                className="text-xs font-semibold text-slate-900 truncate"
+                                title={item.filename}
+                              >
+                                {item.filename}
+                              </span>
+                            </div>
+
+                            {/* Analyzed Semantic Description */}
+                            {item.semantic_caption && (
+                              <p className="text-[11px] text-slate-600 leading-snug line-clamp-2 bg-white border border-slate-200/80 rounded-md px-2.5 py-1.5">
+                                {item.semantic_caption}
+                              </p>
+                            )}
+
+                            {/* Inferred Style & Context Tags */}
+                            {item.tags && item.tags.length > 0 && (
+                              <div className="flex flex-wrap gap-1 pt-0.5">
+                                {item.tags.map((tag, idx) => (
+                                  <span
+                                    key={idx}
+                                    className="text-[10px] px-2 py-0.5 rounded-full bg-slate-200/70 text-slate-800 font-medium"
+                                  >
+                                    {tag}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                           </div>
 
-                          <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                            {item.media_type === 'video' ? (
-                              <div className="flex flex-wrap gap-1">
+                          {/* Applied Technical & EXIF Metadata Footer */}
+                          <div className="pt-2 border-t border-slate-200/70 space-y-1.5 text-[11px]">
+                            {(item.camera_model || item.creation_time) && (
+                              <div className="flex flex-wrap items-center justify-between gap-1 text-slate-600">
+                                {item.camera_model && (
+                                  <span className="font-medium text-slate-700 truncate">
+                                    📷 {item.camera_model}
+                                  </span>
+                                )}
+                                {item.creation_time && (
+                                  <span className="text-[10px] text-slate-500">
+                                    {item.creation_time}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+
+                            <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] text-slate-600">
+                              <span>
+                                Quality <b>{Math.round(item.aesthetic_score * 100)}%</b> • Sharpness{' '}
+                                <b>{Math.round(item.sharpness_score * 100)}%</b>
+                              </span>
+                              {item.focal_point && (
+                                <span className="text-slate-500">
+                                  Focal ({item.focal_point.center_x.toFixed(2)},{' '}
+                                  {item.focal_point.center_y.toFixed(2)})
+                                </span>
+                              )}
+                            </div>
+
+                            {item.media_type === 'video' && item.dance_events.length > 0 && (
+                              <div className="flex flex-wrap gap-1 pt-0.5">
                                 {item.dance_events.map((ev, i) => (
                                   <span
                                     key={i}
-                                    className="px-2 py-0.5 rounded bg-slate-200/80 text-slate-800 font-medium"
+                                    className="px-2 py-0.5 rounded bg-slate-900 text-white text-[10px] font-medium"
                                   >
                                     {ev.move_type === 'jump_peak' ? 'Jump Peak' : 'Turn Peak'} @{' '}
                                     {ev.timestamp_sec.toFixed(2)}s
                                   </span>
                                 ))}
                               </div>
-                            ) : (
-                              <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-medium">
-                                Still Photo • Quality {Math.round(item.aesthetic_score * 100)}%
-                              </span>
                             )}
                           </div>
                         </div>

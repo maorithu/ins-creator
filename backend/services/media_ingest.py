@@ -212,6 +212,15 @@ class GooglePhotosClient:
         except Exception:
             return []
 
+        manifest_path = MEDIA_CACHE_DIR / "gp_manifest.json"
+        gp_manifest: Dict[str, Dict[str, str]] = {}
+        if manifest_path.exists():
+            try:
+                import json
+                gp_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                gp_manifest = {}
+
         ingested: List[MediaItem] = []
         for entry in raw_items[:max_items]:
             if not isinstance(entry, dict):
@@ -224,6 +233,7 @@ class GooglePhotosClient:
             base_url = str(media_file.get("baseUrl") or entry.get("baseUrl") or "")
             mime_type = str(media_file.get("mimeType") or entry.get("mimeType") or "").lower()
             entry_type = str(entry.get("type") or "").upper()
+            create_time_raw = str(entry.get("createTime") or media_file.get("createTime") or "")
             filename = str(
                 media_file.get("filename")
                 or entry.get("filename")
@@ -263,6 +273,11 @@ class GooglePhotosClient:
                     continue
 
             cache_id = f"gp_{item_id[:16]}"
+            gp_manifest[cache_id] = {
+                "filename": filename,
+                "createTime": create_time_raw[:16].replace("T", " ") if create_time_raw else "",
+            }
+
             if cache_id not in _ANALYZED_MEDIA_CACHE:
                 media_obj = MediaItem(
                     id=cache_id,
@@ -274,6 +289,7 @@ class GooglePhotosClient:
                     tags=["google_photos", "dance"],
                     semantic_caption=f"Imported from Google Photos ({filename})",
                     source="google_photos",
+                    creation_time=gp_manifest[cache_id]["createTime"] or None,
                 )
                 if is_video:
                     media_obj = analyze_video_dance_kinematics(media_obj)
@@ -283,27 +299,49 @@ class GooglePhotosClient:
 
             ingested.append(_ANALYZED_MEDIA_CACHE[cache_id].model_copy(deep=True))
 
+        if gp_manifest:
+            try:
+                import json
+                manifest_path.write_text(json.dumps(gp_manifest, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
         return ingested
 
 
 def list_imported_google_photos() -> List[MediaItem]:
     """Returns any previously downloaded Google Photos media items stored in MEDIA_CACHE_DIR."""
+    manifest_path = MEDIA_CACHE_DIR / "gp_manifest.json"
+    gp_manifest: Dict[str, Dict[str, str]] = {}
+    if manifest_path.exists():
+        try:
+            import json
+            gp_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            gp_manifest = {}
+
     results: List[MediaItem] = []
     for fpath in sorted(MEDIA_CACHE_DIR.glob("gp_*"), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not fpath.is_file() or fpath.stat().st_size < 500:
+        if not fpath.is_file() or fpath.suffix.lower() == ".json" or fpath.stat().st_size < 500:
             continue
         cache_id = fpath.stem
+        meta = gp_manifest.get(cache_id, {})
+        orig_filename = meta.get("filename") or fpath.name
+        orig_create_time = meta.get("createTime") or None
+
         if cache_id not in _ANALYZED_MEDIA_CACHE:
             is_video = fpath.suffix.lower() in VIDEO_EXTENSIONS
             item = MediaItem(
                 id=cache_id,
-                filename=fpath.name,
+                filename=orig_filename,
                 filepath=str(fpath),
                 url=f"/static/cache/{fpath.name}",
                 media_type=MediaType.VIDEO if is_video else MediaType.PHOTO,
+                event_category=_infer_event_category_from_text(orig_filename),
                 tags=["google_photos", "dance"],
-                semantic_caption=f"Imported from Google Photos ({fpath.name})",
+                semantic_caption=f"Imported from Google Photos ({orig_filename})",
                 source="google_photos",
+                creation_time=orig_create_time,
             )
             if is_video:
                 item = analyze_video_dance_kinematics(item)
