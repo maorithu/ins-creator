@@ -323,7 +323,7 @@ def _sculpt_choreographic_cues_on_wav(
     if peak > 1e-5:
         out_audio = (out_audio / peak) * 0.90
 
-    sf.write(str(wav_path), out_audio.astype(np.float32), sr)
+    sf.write(str(wav_path), out_audio.astype(np.float32), sr, subtype="PCM_16")
 
 
 def _enrich_music_prompt_with_gemini(
@@ -571,8 +571,41 @@ def _synthesize_dance_track_wav(
 # ============================================================================
 
 _CACHED_CUE_MAPS: Dict[str, AudioCueMap] = {}
+_BUILTIN_REGISTRY_PATH = MUSIC_DIR / "builtin_tracks.json"
 _CUSTOM_REGISTRY_PATH = MUSIC_DIR / "custom_tracks.json"
 _REGISTRY_LOADED = False
+
+
+def _load_builtin_registry() -> None:
+    if not _BUILTIN_REGISTRY_PATH.exists():
+        return
+    try:
+        raw = json.loads(_BUILTIN_REGISTRY_PATH.read_text(encoding="utf-8"))
+        for entry in raw:
+            tid = str(entry.get("track_id", ""))
+            wav_path = MUSIC_DIR / f"{tid}.wav"
+            if tid and wav_path.exists():
+                entry["filepath"] = str(wav_path)
+                entry["url"] = f"/static/music/{wav_path.name}"
+                cue = AudioCueMap(**entry)
+                _CACHED_CUE_MAPS.setdefault(tid, cue)
+    except Exception:
+        pass
+
+
+def _save_builtin_registry() -> None:
+    builtins = []
+    for spec in BUILT_IN_TRACK_SPECS:
+        tid = str(spec["track_id"])
+        if tid in _CACHED_CUE_MAPS:
+            d = _CACHED_CUE_MAPS[tid].model_dump()
+            # Store portable relative path in JSON so any git checkout works cleanly
+            d["filepath"] = f"data/music/{tid}.wav"
+            builtins.append(d)
+    try:
+        _BUILTIN_REGISTRY_PATH.write_text(json.dumps(builtins, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _load_custom_registry() -> None:
@@ -580,6 +613,7 @@ def _load_custom_registry() -> None:
     if _REGISTRY_LOADED:
         return
     _REGISTRY_LOADED = True
+    _load_builtin_registry()
     if not _CUSTOM_REGISTRY_PATH.exists():
         return
     try:
@@ -609,14 +643,14 @@ def register_custom_music_track(cue_map: AudioCueMap) -> AudioCueMap:
     return cue_map
 
 
-def _generate_single_builtin_spec(spec: Dict[str, Any], needs_upgrade: bool) -> AudioCueMap:
+def _generate_single_builtin_spec(spec: Dict[str, Any], force_regenerate: bool) -> AudioCueMap:
     track_id = str(spec["track_id"])
     wav_path = MUSIC_DIR / f"{track_id}.wav"
     pause_win = tuple(spec["pause_window"])
     sust_win = tuple(spec["sustained_window"])
     chords = list(spec["chords_midi"])
 
-    if needs_upgrade or not wav_path.exists():
+    if force_regenerate or not wav_path.exists():
         lyria_prompt = str(spec.get("lyria_prompt") or spec["title"])
         generated_ok = _generate_audio_via_gemini_lyria(
             prompt=lyria_prompt,
@@ -649,34 +683,33 @@ def _generate_single_builtin_spec(spec: Dict[str, Any], needs_upgrade: bool) -> 
 
 
 def ensure_builtin_music_tracks(force_regenerate: bool = False) -> List[AudioCueMap]:
-    """Ensures all 10 built-in dance tracks are generated via Gemini Lyria and analyzed, plus any custom tracks."""
+    """
+    Loads the pre-generated built-in dance tracks and their pre-computed cue maps from `data/music/`
+    (checked into the repository). Only generates audio if a `.wav` file is physically missing
+    or `force_regenerate=True` is explicitly requested.
+    """
     _load_custom_registry()
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
-    version_file = MUSIC_DIR / ".music_engine_version"
-    needs_upgrade = force_regenerate or (
-        not version_file.exists()
-        or version_file.read_text(encoding="utf-8").strip() != MUSIC_ENGINE_VERSION
-    )
+    if not _CACHED_CUE_MAPS:
+        _load_builtin_registry()
 
     builtin_ids = {str(s["track_id"]) for s in BUILT_IN_TRACK_SPECS}
-    if needs_upgrade:
+    if force_regenerate:
         for bid in list(builtin_ids):
             _CACHED_CUE_MAPS.pop(bid, None)
 
     missing_specs = [
         s for s in BUILT_IN_TRACK_SPECS
-        if needs_upgrade or str(s["track_id"]) not in _CACHED_CUE_MAPS or not (MUSIC_DIR / f"{s['track_id']}.wav").exists()
+        if force_regenerate or str(s["track_id"]) not in _CACHED_CUE_MAPS or not (MUSIC_DIR / f"{s['track_id']}.wav").exists()
     ]
 
     if missing_specs:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(_generate_single_builtin_spec, spec, needs_upgrade) for spec in missing_specs]
+            futures = [pool.submit(_generate_single_builtin_spec, spec, force_regenerate) for spec in missing_specs]
             for fut in futures:
                 cue_map = fut.result()
                 _CACHED_CUE_MAPS[cue_map.track_id] = cue_map
-
-    if needs_upgrade:
-        version_file.write_text(MUSIC_ENGINE_VERSION, encoding="utf-8")
+        _save_builtin_registry()
 
     results: List[AudioCueMap] = [
         _CACHED_CUE_MAPS[str(spec["track_id"])] for spec in BUILT_IN_TRACK_SPECS

@@ -19,8 +19,21 @@ frontend/dist/
 .dev.vars
 !.dev.vars.example
 
-# Generated runtime media, audio, exports, and sessions
-data/
+# Generated runtime media, audio, exports, and sessions (keep checked-in built-in music tracks)
+data/*
+!data/music/
+data/music/*
+!data/music/ballet_adagio_swan.wav
+!data/music/ballet_waltz_flowers.wav
+!data/music/ballet_variation_sugarplum.wav
+!data/music/lyrical_piano_strings.wav
+!data/music/neoclassical_chamber_pulse.wav
+!data/music/studio_hiphop_beat.wav
+!data/music/contemporary_dramatic_build.wav
+!data/music/jazz_funk_broadway.wav
+!data/music/competition_edm_pop.wav
+!data/music/kpop_fierce_encore.wav
+!data/music/builtin_tracks.json
 
 # OS & Editor files
 .DS_Store
