@@ -105,24 +105,42 @@ export function App() {
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [googleClientIdInput, setGoogleClientIdInput] = useState('');
+  const [googleClientSecretInput, setGoogleClientSecretInput] = useState('');
   const [googleTokenInput, setGoogleTokenInput] = useState('');
+  const [googlePhotosConnected, setGooglePhotosConnected] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   useEffect(() => {
     void loadInitialCatalog();
+    const onMessage = (event: MessageEvent) => {
+      if (event.data && event.data.type === 'GOOGLE_PHOTOS_CONNECTED') {
+        setGooglePhotosConnected(true);
+        setShowSettingsModal(false);
+        setStatusMessage('Google Photos account connected! Click "Google Photos" to pick your album or photos.');
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
   }, []);
 
   async function loadInitialCatalog() {
     try {
-      const [pRes, mRes, mediaRes] = await Promise.all([
+      const [hRes, pRes, mRes, mediaRes] = await Promise.all([
+        fetch('/api/health'),
         fetch('/api/presets'),
         fetch('/api/music/tracks'),
         fetch(`/api/media/search?query=${encodeURIComponent(searchQuery)}&source=auto`),
       ]);
+      const hData = await hRes.json();
       const pData: StylePreset[] = await pRes.json();
       const mData: AudioCueMap[] = await mRes.json();
       const mediaData: MediaItem[] = await mediaRes.json();
 
+      if (hData.google_client_id) {
+        setGoogleClientIdInput(hData.google_client_id);
+      }
+      setGooglePhotosConnected(Boolean(hData.google_photos_configured));
       setPresets(pData);
       setMusicTracks(mData);
       setMatchedMedia(mediaData);
@@ -178,6 +196,28 @@ export function App() {
     }
   }
 
+  async function handleStartGoogleOAuthSignIn() {
+    try {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          google_client_id: googleClientIdInput,
+          google_client_secret: googleClientSecretInput,
+        }),
+      });
+      const res = await fetch('/api/auth/google/start');
+      const data = await res.json();
+      if (data.auth_url) {
+        window.open(data.auth_url, 'google_oauth_popup', 'width=540,height=680');
+        setStatusMessage('Opened Google Sign-In window. Authorize access to connect your Google Photos.');
+      }
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('Could not start Google OAuth flow.');
+    }
+  }
+
   async function handleGooglePhotosPicker() {
     setStatusMessage('Connecting to Google Photos Picker API...');
     try {
@@ -189,8 +229,7 @@ export function App() {
       } else {
         setShowSettingsModal(true);
         setStatusMessage(
-          data.message ||
-            'Configure your Google Photos OAuth token in Settings, or use Local Folder / Sample Media.'
+          'Click "Sign in with Google" in the Settings dialog (or paste an OAuth token) to connect Google Photos.'
         );
       }
     } catch (err) {
@@ -387,14 +426,18 @@ export function App() {
   }
 
   async function handleSaveSettings() {
-    await fetch('/api/config', {
+    const res = await fetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         gemini_api_key: geminiKeyInput,
+        google_client_id: googleClientIdInput,
+        google_client_secret: googleClientSecretInput,
         google_photos_access_token: googleTokenInput,
       }),
     });
+    const data = await res.json();
+    setGooglePhotosConnected(Boolean(data.google_photos_configured));
     setShowSettingsModal(false);
     setStatusMessage('Credentials saved.');
   }
@@ -1465,38 +1508,89 @@ export function App() {
       {/* Clean Settings Modal */}
       {showSettingsModal && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
-          <div className="w-full max-w-md rounded-xl bg-white border border-slate-200 p-6 space-y-4 shadow-xl">
-            <h3 className="text-base font-semibold text-slate-900 flex items-center gap-2">
-              <Settings className="w-4 h-4 text-slate-600" />
-              Google Photos & API Credentials
-            </h3>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              Ins-Creator runs locally out-of-the-box. To fetch media directly from your personal Google Photos account or use live Gemini API copywriting, enter your credentials below:
-            </p>
+          <div className="w-full max-w-lg rounded-xl bg-white border border-slate-200 p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-slate-900 flex items-center gap-2">
+                <Settings className="w-4 h-4 text-slate-600" />
+                Google Photos OAuth & API Settings
+              </h3>
+              {googlePhotosConnected && (
+                <span className="text-xs px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">
+                  Google Photos Connected
+                </span>
+              )}
+            </div>
 
-            <div className="space-y-3">
+            <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2.5">
+              <div className="text-xs font-semibold text-slate-800">
+                1-Click Google Photos Sign-In (OAuth 2.0)
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Your Client ID is pre-loaded. In Google Cloud Console under your OAuth Client ID, ensure{' '}
+                <code className="px-1.5 py-0.5 rounded bg-slate-200 text-slate-800 font-mono text-[11px]">
+                  http://127.0.0.1:8000/api/auth/google/callback
+                </code>{' '}
+                is listed under <b>Authorized redirect URIs</b>, then click below:
+              </p>
+
+              <div className="space-y-2">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-0.5">
+                    Google OAuth Client ID
+                  </label>
+                  <input
+                    type="text"
+                    value={googleClientIdInput}
+                    onChange={(e) => setGoogleClientIdInput(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-0.5">
+                    Google OAuth Client Secret (Optional for Desktop App / Required for Web App Client)
+                  </label>
+                  <input
+                    type="password"
+                    value={googleClientSecretInput}
+                    onChange={(e) => setGoogleClientSecretInput(e.target.value)}
+                    placeholder="GOCSPX-..."
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <button
+                onClick={handleStartGoogleOAuthSignIn}
+                className="w-full py-2 px-4 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition cursor-pointer"
+              >
+                Sign in with Google & Authorize Google Photos
+              </button>
+            </div>
+
+            <div className="space-y-3 pt-1">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Google Photos OAuth Access Token
+                  Or Paste Google Photos OAuth Bearer Token Directly
                 </label>
                 <input
                   type="password"
                   value={googleTokenInput}
                   onChange={(e) => setGoogleTokenInput(e.target.value)}
-                  placeholder="Enter OAuth Bearer token..."
+                  placeholder="ya29.a0..."
                   className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Google Gemini API Key
+                  Google Gemini API Key (Configured)
                 </label>
                 <input
                   type="password"
                   value={geminiKeyInput}
                   onChange={(e) => setGeminiKeyInput(e.target.value)}
-                  placeholder="Enter GEMINI_API_KEY..."
+                  placeholder="Leave blank to keep existing key..."
                   className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900"
                 />
               </div>
@@ -1507,7 +1601,7 @@ export function App() {
                 onClick={() => setShowSettingsModal(false)}
                 className="px-4 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700"
               >
-                Cancel
+                Close
               </button>
               <button
                 onClick={handleSaveSettings}

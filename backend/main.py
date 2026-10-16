@@ -104,6 +104,8 @@ def _load_session(session_id: str) -> WorkflowSession:
 class ConfigUpdatePayload(BaseModel):
     gemini_api_key: Optional[str] = None
     google_photos_access_token: Optional[str] = None
+    google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
     ai_music_api_key: Optional[str] = None
 
 
@@ -113,11 +115,16 @@ class MusicGeneratePayload(BaseModel):
     preferred_bpm: Optional[float] = None
 
 
+_PKCE_VERIFIER_STORE: Dict[str, str] = {}
+
+
 @app.get("/api/health")
 def health_check() -> Dict[str, object]:
     return {
         "status": "ok",
         "gemini_configured": bool(settings.gemini_api_key),
+        "google_client_id_configured": bool(settings.google_client_id),
+        "google_client_id": settings.google_client_id or "",
         "google_photos_configured": bool(settings.google_photos_access_token),
         "capcut_drafts_dir": str(settings.capcut_drafts_dir),
     }
@@ -125,18 +132,125 @@ def health_check() -> Dict[str, object]:
 
 @app.post("/api/config")
 def update_runtime_config(payload: ConfigUpdatePayload) -> Dict[str, object]:
-    if payload.gemini_api_key is not None:
-        settings.gemini_api_key = payload.gemini_api_key.strip() or None
-    if payload.google_photos_access_token is not None:
-        settings.google_photos_access_token = payload.google_photos_access_token.strip() or None
-    if payload.ai_music_api_key is not None:
-        settings.ai_music_api_key = payload.ai_music_api_key.strip() or None
+    if payload.gemini_api_key is not None and payload.gemini_api_key.strip():
+        settings.gemini_api_key = payload.gemini_api_key.strip()
+    if payload.google_photos_access_token is not None and payload.google_photos_access_token.strip():
+        settings.save_oauth_tokens(access_token=payload.google_photos_access_token.strip())
+    if payload.google_client_id is not None and payload.google_client_id.strip():
+        settings.save_oauth_tokens(client_id=payload.google_client_id.strip())
+    if payload.google_client_secret is not None and payload.google_client_secret.strip():
+        settings.save_oauth_tokens(client_secret=payload.google_client_secret.strip())
+    if payload.ai_music_api_key is not None and payload.ai_music_api_key.strip():
+        settings.ai_music_api_key = payload.ai_music_api_key.strip()
     return {
         "status": "updated",
         "gemini_configured": bool(settings.gemini_api_key),
+        "google_client_id_configured": bool(settings.google_client_id),
         "google_photos_configured": bool(settings.google_photos_access_token),
         "ai_music_configured": bool(settings.ai_music_api_key),
     }
+
+
+@app.get("/api/auth/google/start")
+def start_google_oauth_flow(
+    redirect_uri: str = "http://127.0.0.1:8000/api/auth/google/callback",
+) -> Dict[str, object]:
+    """Generates a Google OAuth 2.0 authorization URL (with PKCE) using the configured GOOGLE_CLIENT_ID."""
+    import base64
+    import hashlib
+    import secrets
+    import urllib.parse
+
+    client_id = settings.google_client_id
+    if not client_id:
+        raise HTTPException(status_code=400, detail="GOOGLE_CLIENT_ID is not configured.")
+
+    code_verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    state = secrets.token_urlsafe(16)
+    _PKCE_VERIFIER_STORE[state] = code_verifier
+
+    scopes = " ".join(
+        [
+            "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+            "https://www.googleapis.com/auth/photoslibrary.readonly",
+        ]
+    )
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": scopes,
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+    return {"auth_url": auth_url, "redirect_uri": redirect_uri, "client_id": client_id}
+
+
+@app.get("/api/auth/google/callback")
+def google_oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """Handles the OAuth2 redirect from Google, exchanges the authorization code for an access token, and closes the popup."""
+    from fastapi.responses import HTMLResponse
+    import httpx
+
+    if error:
+        return HTMLResponse(
+            f"<html><body style='font-family:sans-serif;padding:32px;'><h3>Google OAuth Error: {error}</h3>"
+            f"<p>Make sure <code>http://127.0.0.1:8000/api/auth/google/callback</code> is listed under Authorized Redirect URIs in your Google Cloud OAuth Client, or enter your Client Secret in Settings if using a Web Application client.</p></body></html>"
+        )
+
+    if not code:
+        return HTMLResponse("<html><body>Missing authorization code.</body></html>")
+
+    code_verifier = _PKCE_VERIFIER_STORE.get(state or "", "")
+    token_payload = {
+        "client_id": settings.google_client_id or "",
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": "http://127.0.0.1:8000/api/auth/google/callback",
+    }
+    if code_verifier:
+        token_payload["code_verifier"] = code_verifier
+    if settings.google_client_secret:
+        token_payload["client_secret"] = settings.google_client_secret
+
+    resp = httpx.post("https://oauth2.googleapis.com/token", data=token_payload, timeout=15.0)
+    if resp.status_code == 200:
+        token_data = resp.json()
+        settings.save_oauth_tokens(
+            access_token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+        )
+        return HTMLResponse(
+            """<html><body style="font-family:sans-serif;padding:40px;text-align:center;">
+            <h2>Google Photos Connected Successfully</h2>
+            <p>You can close this window and return to Ins-Creator.</p>
+            <script>
+              if (window.opener) {
+                window.opener.postMessage({ type: 'GOOGLE_PHOTOS_CONNECTED' }, '*');
+                setTimeout(() => window.close(), 800);
+              }
+            </script>
+            </body></html>"""
+        )
+
+    return HTMLResponse(
+        f"<html><body style='font-family:sans-serif;padding:32px;'>"
+        f"<h3>Token Exchange Needs Client Secret</h3>"
+        f"<p>Google returned: <code>{resp.text}</code></p>"
+        f"<p>If your OAuth Client ID is a <b>Web application</b> client, paste its <b>Client Secret</b> in the Settings modal of Ins-Creator and click Connect again.</p>"
+        f"</body></html>"
+    )
 
 
 @app.get("/api/presets", response_model=List[StylePreset])
