@@ -37,6 +37,9 @@ export interface MediaItem {
   focal_point: BoundingBoxCenter;
   source: string;
   query_match_score: number;
+  trim_mode?: 'auto' | 'manual' | string;
+  trim_start_sec?: number | null;
+  trim_end_sec?: number | null;
 }
 
 export interface AudioSectionCue {
@@ -111,6 +114,7 @@ export interface TimelineClip {
 export interface InstagramPostCopy {
   hook_title_overlay: string;
   ending_call_to_action: string;
+  video_title_style?: 'minimal_lower_third' | 'cinema_subtitle' | 'frosted_pill' | 'none' | string;
   post_headline: string;
   caption_primary: string;
   caption_alternatives: { label: string; text: string }[];

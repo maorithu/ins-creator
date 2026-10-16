@@ -27,19 +27,35 @@ import {
 } from './types';
 
 const PHOTO_EFFECT_OPTIONS = [
-  { value: 'ken_burns_zoom_in', label: 'Ken Burns Slow Zoom In (Focus Subject)' },
-  { value: 'ken_burns_zoom_out', label: 'Ken Burns Pull Out' },
-  { value: 'ken_burns_pan_diag', label: 'Ken Burns Diagonal Pan' },
-  { value: 'ken_burns_pan_lr', label: 'Ken Burns Horizontal Pan' },
-  { value: 'beat_pulse_zoom', label: 'Beat-Pulse Subtle Zoom' },
-  { value: 'soft_glow_dissolve', label: 'Soft Dissolve' },
+  { value: 'ken_burns_zoom_in', label: 'Slow Cinematic Zoom-In (Focus Dancer)' },
+  { value: 'ken_burns_zoom_out', label: 'Wide Stage Reveal Zoom-Out' },
+  { value: 'ken_burns_pan_lr', label: 'Smooth Stage Pan (Left → Right)' },
+  { value: 'ken_burns_pan_rl', label: 'Smooth Stage Pan (Right → Left)' },
+  { value: 'ken_burns_pan_diag', label: 'Dynamic Diagonal Drift' },
+  { value: 'tilt_up_stage', label: 'Vertical Tilt Up (Floor to Spotlight)' },
+  { value: 'beat_pulse_zoom', label: 'Rhythmic Beat-Pulse Zoom' },
+  { value: 'soft_glow_dissolve', label: 'Dreamy Stage Bloom & Soft Zoom' },
+  { value: 'spotlight_vignette', label: 'Stage Spotlight Vignette & Focus' },
+  { value: 'polaroid_frame', label: 'Editorial Gallery Framed Portrait' },
 ];
 
 const TRANSITION_OPTIONS = [
-  { value: 'cut_on_beat', label: 'Cut on Beat' },
-  { value: 'flash_white', label: 'White Flash' },
-  { value: 'cross_dissolve', label: 'Cross Dissolve' },
-  { value: 'zoom_whip', label: 'Zoom Transition' },
+  { value: 'cut_on_beat', label: 'Hard Cut on Beat' },
+  { value: 'cross_dissolve', label: 'Smooth Cross-Dissolve' },
+  { value: 'flash_white', label: 'Stage Strobe White Flash' },
+  { value: 'dip_to_black', label: 'Cinematic Fade from Black' },
+  { value: 'zoom_whip', label: 'Dynamic Zoom-In Whip' },
+  { value: 'slide_left', label: 'Smooth Slide Left Push' },
+  { value: 'slide_up', label: 'Vertical Reel Slide Up' },
+  { value: 'light_leak_warm', label: 'Golden Stage Light Leak' },
+  { value: 'blur_dissolve', label: 'Defocus Rack-Focus Dissolve' },
+];
+
+const VIDEO_TITLE_STYLE_OPTIONS = [
+  { value: 'minimal_lower_third', label: 'Minimal Editorial Lower-Third (Default)' },
+  { value: 'cinema_subtitle', label: 'Clean Cinema Subtitle (No Box)' },
+  { value: 'frosted_pill', label: 'Modern Frosted Glass Pill' },
+  { value: 'none', label: 'No Text on Video (100% Clean Video)' },
 ];
 
 const WORKFLOW_STEPS = [
@@ -74,6 +90,10 @@ export function App() {
   const [musicTracks, setMusicTracks] = useState<AudioCueMap[]>([]);
   const [matchedMedia, setMatchedMedia] = useState<MediaItem[]>([]);
   const [selectedMediaIds, setSelectedMediaIds] = useState<Set<string>>(new Set());
+  const [mediaTrims, setMediaTrims] = useState<
+    Record<string, { trim_mode: 'auto' | 'manual'; trim_start_sec: number; trim_end_sec: number }>
+  >({});
+  const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
 
   // User workflow inputs
   const [selectedPresetId, setSelectedPresetId] = useState('competition_stage_glory');
@@ -480,6 +500,58 @@ export function App() {
     }
   }
 
+  function updateMediaTrim(
+    mediaId: string,
+    totalDuration: number,
+    patch: Partial<{ trim_mode: 'auto' | 'manual'; trim_start_sec: number; trim_end_sec: number }>
+  ) {
+    setMediaTrims((prev) => {
+      const existing = prev[mediaId] || {
+        trim_mode: 'auto',
+        trim_start_sec: 0,
+        trim_end_sec: Math.round(totalDuration * 10) / 10,
+      };
+      const next = { ...existing, ...patch };
+      if (next.trim_start_sec < 0) next.trim_start_sec = 0;
+      if (next.trim_end_sec > totalDuration) next.trim_end_sec = Math.round(totalDuration * 10) / 10;
+      if (next.trim_end_sec <= next.trim_start_sec + 0.5) {
+        next.trim_end_sec = Math.min(
+          Math.round(totalDuration * 10) / 10,
+          Math.round((next.trim_start_sec + 2.5) * 10) / 10
+        );
+      }
+      return { ...prev, [mediaId]: next };
+    });
+  }
+
+  function seekAndSelectVideoPortion(
+    mediaId: string,
+    totalDuration: number,
+    centerSec: number,
+    windowHalfSec: number = 1.6
+  ) {
+    const startSec = Math.max(0, Math.round((centerSec - windowHalfSec) * 10) / 10);
+    const endSec = Math.min(
+      Math.round(totalDuration * 10) / 10,
+      Math.round((centerSec + windowHalfSec) * 10) / 10
+    );
+    updateMediaTrim(mediaId, totalDuration, {
+      trim_mode: 'manual',
+      trim_start_sec: startSec,
+      trim_end_sec: endSec,
+    });
+    const vidEl = videoRefs.current[mediaId];
+    if (vidEl) {
+      vidEl.currentTime = startSec;
+      void vidEl.play().catch(() => {});
+      window.setTimeout(() => {
+        if (vidEl && !vidEl.paused) {
+          vidEl.pause();
+        }
+      }, Math.max(1500, (endSec - startSec) * 1000));
+    }
+  }
+
   async function handleGenerateSessionAndAdvance() {
     setIsGeneratingSession(true);
     setStatusMessage(
@@ -498,6 +570,7 @@ export function App() {
           music_generation_prompt: null,
           target_duration_sec: targetDurationSec,
           selected_media_ids: selectedMediaIds.size > 0 ? Array.from(selectedMediaIds) : null,
+          media_trims: Object.keys(mediaTrims).length > 0 ? mediaTrims : null,
           auto_render_mp4: true,
           auto_export_capcut: true,
         }),
@@ -941,6 +1014,12 @@ export function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {matchedMedia.map((item) => {
                     const isChecked = selectedMediaIds.has(item.id);
+                    const vTrim = mediaTrims[item.id] || {
+                      trim_mode: item.trim_mode === 'manual' ? 'manual' : 'auto',
+                      trim_start_sec: item.trim_start_sec ?? 0,
+                      trim_end_sec:
+                        item.trim_end_sec ?? Math.round((item.duration_sec || 10) * 10) / 10,
+                    };
                     return (
                       <div
                         key={item.id}
@@ -961,14 +1040,21 @@ export function App() {
                             />
                           ) : (
                             <video
+                              ref={(el) => {
+                                videoRefs.current[item.id] = el;
+                              }}
                               src={item.url}
+                              controls={vTrim.trim_mode === 'manual'}
                               muted
                               playsInline
                               preload="metadata"
+                              onClick={(e) => {
+                                if (vTrim.trim_mode === 'manual') e.stopPropagation();
+                              }}
                               className="w-full h-full object-cover"
                             />
                           )}
-                          <div className="absolute top-2 left-2 flex items-center gap-1.5">
+                          <div className="absolute top-2 left-2 flex items-center gap-1.5 pointer-events-none">
                             <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-slate-900/80 text-white uppercase">
                               {item.media_type}
                             </span>
@@ -978,7 +1064,7 @@ export function App() {
                               </span>
                             )}
                           </div>
-                          <span className="absolute top-2 right-2 text-[10px] font-medium px-2 py-0.5 rounded bg-slate-900/80 text-slate-100">
+                          <span className="absolute top-2 right-2 text-[10px] font-medium px-2 py-0.5 rounded bg-slate-900/80 text-slate-100 pointer-events-none">
                             {item.width}×{item.height}
                             {item.media_type === 'video' ? ` • ${item.duration_sec.toFixed(1)}s` : ''}
                           </span>
@@ -1023,8 +1109,8 @@ export function App() {
                             )}
                           </div>
 
-                          {/* Applied Technical & EXIF Metadata Footer */}
-                          <div className="pt-2 border-t border-slate-200/70 space-y-1.5 text-[11px]">
+                          {/* Applied Technical & EXIF Metadata + Video Portion Selection Footer */}
+                          <div className="pt-2 border-t border-slate-200/70 space-y-2 text-[11px]">
                             {(item.camera_model || item.creation_time) && (
                               <div className="flex flex-wrap items-center justify-between gap-1 text-slate-600">
                                 {item.camera_model && (
@@ -1053,17 +1139,144 @@ export function App() {
                               )}
                             </div>
 
-                            {item.media_type === 'video' && item.dance_events.length > 0 && (
-                              <div className="flex flex-wrap gap-1 pt-0.5">
-                                {item.dance_events.map((ev, i) => (
-                                  <span
-                                    key={i}
-                                    className="px-2 py-0.5 rounded bg-slate-900 text-white text-[10px] font-medium"
-                                  >
-                                    {ev.move_type === 'jump_peak' ? 'Jump Peak' : 'Turn Peak'} @{' '}
-                                    {ev.timestamp_sec.toFixed(2)}s
+                            {/* Video Portion Selection: Auto AI Peaks vs. Manual Trim Range */}
+                            {item.media_type === 'video' && (
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="p-2.5 rounded-lg bg-white border border-slate-200 space-y-2 mt-1 cursor-default"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-[10px] font-semibold text-slate-800 flex items-center gap-1">
+                                    <Scissors className="w-3 h-3 text-slate-600" />
+                                    Video Portion Selection
                                   </span>
-                                ))}
+                                  <div className="inline-flex rounded-md border border-slate-200 p-0.5 bg-slate-100">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateMediaTrim(item.id, item.duration_sec, {
+                                          trim_mode: 'auto',
+                                        })
+                                      }
+                                      className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
+                                        vTrim.trim_mode === 'auto'
+                                          ? 'bg-slate-900 text-white'
+                                          : 'text-slate-600 hover:text-slate-900'
+                                      }`}
+                                    >
+                                      Auto (AI Peaks)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateMediaTrim(item.id, item.duration_sec, {
+                                          trim_mode: 'manual',
+                                        })
+                                      }
+                                      className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
+                                        vTrim.trim_mode === 'manual'
+                                          ? 'bg-slate-900 text-white'
+                                          : 'text-slate-600 hover:text-slate-900'
+                                      }`}
+                                    >
+                                      Manual Trim
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {vTrim.trim_mode === 'manual' ? (
+                                  <div className="space-y-1.5">
+                                    <div className="grid grid-cols-2 gap-2">
+                                      <div>
+                                        <label className="block text-[9px] text-slate-500">
+                                          Start (0s – {item.duration_sec.toFixed(1)}s)
+                                        </label>
+                                        <input
+                                          type="number"
+                                          step={0.5}
+                                          min={0}
+                                          max={Math.max(0, item.duration_sec - 1)}
+                                          value={vTrim.trim_start_sec}
+                                          onChange={(e) =>
+                                            updateMediaTrim(item.id, item.duration_sec, {
+                                              trim_mode: 'manual',
+                                              trim_start_sec: Number(e.target.value) || 0,
+                                            })
+                                          }
+                                          className="w-full rounded border border-slate-300 px-2 py-1 text-[11px] font-mono text-slate-900"
+                                        />
+                                      </div>
+                                      <div>
+                                        <label className="block text-[9px] text-slate-500">
+                                          End (max {item.duration_sec.toFixed(1)}s)
+                                        </label>
+                                        <input
+                                          type="number"
+                                          step={0.5}
+                                          min={0.5}
+                                          max={item.duration_sec}
+                                          value={vTrim.trim_end_sec}
+                                          onChange={(e) =>
+                                            updateMediaTrim(item.id, item.duration_sec, {
+                                              trim_mode: 'manual',
+                                              trim_end_sec:
+                                                Number(e.target.value) || item.duration_sec,
+                                            })
+                                          }
+                                          className="w-full rounded border border-slate-300 px-2 py-1 text-[11px] font-mono text-slate-900"
+                                        />
+                                      </div>
+                                    </div>
+                                    <div className="flex items-center justify-between text-[10px] text-slate-600">
+                                      <span>
+                                        Selected: <b>{vTrim.trim_start_sec.toFixed(1)}s</b> –{' '}
+                                        <b>{vTrim.trim_end_sec.toFixed(1)}s</b> (
+                                        {Math.max(0, vTrim.trim_end_sec - vTrim.trim_start_sec).toFixed(1)}s)
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const vidEl = videoRefs.current[item.id];
+                                          if (vidEl) {
+                                            vidEl.currentTime = vTrim.trim_start_sec;
+                                            void vidEl.play().catch(() => {});
+                                          }
+                                        }}
+                                        className="text-[10px] font-semibold text-slate-900 underline cursor-pointer"
+                                      >
+                                        Preview Range
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <p className="text-[10px] text-slate-500">
+                                    Automatically slip-syncs the best detected jump/turn peaks to musical downbeats. Click any peak below to preview or lock onto it:
+                                  </p>
+                                )}
+
+                                {item.dance_events.length > 0 && (
+                                  <div className="flex flex-wrap gap-1 pt-0.5 max-h-16 overflow-y-auto">
+                                    {item.dance_events.map((ev, i) => (
+                                      <button
+                                        key={i}
+                                        type="button"
+                                        onClick={() =>
+                                          seekAndSelectVideoPortion(
+                                            item.id,
+                                            item.duration_sec,
+                                            ev.timestamp_sec,
+                                            1.8
+                                          )
+                                        }
+                                        title="Click to preview & select this movement peak"
+                                        className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-700 text-white text-[10px] font-medium transition cursor-pointer"
+                                      >
+                                        {ev.move_type === 'jump_peak' ? 'Jump' : 'Turn'} @{' '}
+                                        {ev.timestamp_sec.toFixed(1)}s
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>
@@ -1627,6 +1840,9 @@ export function App() {
                   <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
                     {timelineClips.map((clip, idx) => {
                       const isPhoto = clip.media_type === 'photo';
+                      const matchedMedia = session?.matched_media.find((m) => m.id === clip.media_id);
+                      const maxVideoDur = matchedMedia?.duration_sec || 60;
+                      const slotDuration = Math.max(0.8, Number((clip.timeline_end_sec - clip.timeline_start_sec).toFixed(2)));
                       return (
                         <div
                           key={clip.clip_id}
@@ -1651,6 +1867,11 @@ export function App() {
                                       ? 'Downbeat • Turn Peak'
                                       : 'Downbeat • Jump Peak'}
                                   </span>
+                                  {!isPhoto && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                      Source: {clip.source_in_sec.toFixed(1)}s – {clip.source_out_sec.toFixed(1)}s
+                                    </span>
+                                  )}
                                 </div>
                                 <p className="text-xs text-slate-600 mt-1">
                                   {clip.sync_explanation}
@@ -1685,7 +1906,7 @@ export function App() {
                             {isPhoto ? (
                               <div className="sm:col-span-2">
                                 <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                                  Photo Effect (Ken Burns / Zoom)
+                                  Photo Effect / Style
                                 </label>
                                 <select
                                   value={clip.photo_effect || 'ken_burns_zoom_in'}
@@ -1702,19 +1923,108 @@ export function App() {
                                 </select>
                               </div>
                             ) : (
-                              <div className="sm:col-span-2">
-                                <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                                  Beat Synchronization & Speed Profile
-                                </label>
-                                <div className="px-2.5 py-1.5 rounded-md border border-slate-200 bg-white text-xs text-slate-700 truncate">
-                                  {clip.speed_ramp_curve || '1.0x Direct Slip-Sync to Downbeat'}
+                              <div className="sm:col-span-2 space-y-1.5">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <label className="block text-[11px] font-medium text-slate-600">
+                                    Video Portion (Source In / Out • Max {maxVideoDur.toFixed(1)}s)
+                                  </label>
+                                  <span className="text-[10px] text-slate-500">
+                                    Slot length: {slotDuration.toFixed(1)}s
+                                  </span>
                                 </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-md px-2 py-1">
+                                    <span className="text-[10px] text-slate-500 font-medium">In (s):</span>
+                                    <input
+                                      type="number"
+                                      step="0.2"
+                                      min={0}
+                                      max={Math.max(0, maxVideoDur - 0.5)}
+                                      value={clip.source_in_sec}
+                                      onChange={(e) => {
+                                        const newIn = Math.max(0, Number(e.target.value) || 0);
+                                        const newOut = Number(Math.min(maxVideoDur, Math.max(newIn + 0.8, newIn + slotDuration)).toFixed(2));
+                                        setTimelineClips((prev) => {
+                                          const copy = [...prev];
+                                          copy[idx] = {
+                                            ...copy[idx],
+                                            source_in_sec: Number(newIn.toFixed(2)),
+                                            source_out_sec: newOut,
+                                            sync_explanation: `Manual video portion [${newIn.toFixed(1)}s–${newOut.toFixed(1)}s] synced to musical cue.`,
+                                          };
+                                          return copy;
+                                        });
+                                      }}
+                                      className="w-full text-xs font-mono text-slate-900 focus:outline-none"
+                                    />
+                                  </div>
+                                  <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-md px-2 py-1">
+                                    <span className="text-[10px] text-slate-500 font-medium">Out (s):</span>
+                                    <input
+                                      type="number"
+                                      step="0.2"
+                                      min={0.5}
+                                      max={maxVideoDur}
+                                      value={clip.source_out_sec}
+                                      onChange={(e) => {
+                                        const newOut = Math.min(maxVideoDur, Math.max((clip.source_in_sec || 0) + 0.5, Number(e.target.value) || 1));
+                                        setTimelineClips((prev) => {
+                                          const copy = [...prev];
+                                          copy[idx] = {
+                                            ...copy[idx],
+                                            source_out_sec: Number(newOut.toFixed(2)),
+                                            sync_explanation: `Manual video portion [${clip.source_in_sec.toFixed(1)}s–${newOut.toFixed(1)}s] synced to musical cue.`,
+                                          };
+                                          return copy;
+                                        });
+                                      }}
+                                      className="w-full text-xs font-mono text-slate-900 focus:outline-none"
+                                    />
+                                  </div>
+                                </div>
+                                {matchedMedia && matchedMedia.dance_events.length > 0 && (
+                                  <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                                    <span className="text-[10px] text-slate-500">Auto-snap to AI Peak:</span>
+                                    {matchedMedia.dance_events.slice(0, 6).map((ev, evIdx) => {
+                                      const halfWin = Math.max(1.1, slotDuration / 2);
+                                      const targetIn = Number(Math.max(0, Math.min(maxVideoDur - slotDuration, ev.timestamp_sec - halfWin)).toFixed(2));
+                                      const targetOut = Number(Math.min(maxVideoDur, targetIn + slotDuration).toFixed(2));
+                                      const isSelectedPeak = Math.abs(clip.source_in_sec - targetIn) < 0.35;
+                                      return (
+                                        <button
+                                          key={evIdx}
+                                          type="button"
+                                          onClick={() => {
+                                            setTimelineClips((prev) => {
+                                              const copy = [...prev];
+                                              copy[idx] = {
+                                                ...copy[idx],
+                                                source_in_sec: targetIn,
+                                                source_out_sec: targetOut,
+                                                matched_dance_move: ev.move_type,
+                                                sync_explanation: `Synced ${ev.move_type === 'jump_peak' ? 'Jump Apex' : 'Turn Peak'} @ ${ev.timestamp_sec.toFixed(2)}s [${targetIn.toFixed(1)}s–${targetOut.toFixed(1)}s] to downbeat.`,
+                                              };
+                                              return copy;
+                                            });
+                                          }}
+                                          className={`text-[10px] px-1.5 py-0.5 rounded border transition cursor-pointer ${
+                                            isSelectedPeak
+                                              ? 'bg-indigo-600 text-white border-indigo-600 font-semibold'
+                                              : 'bg-white text-indigo-700 border-indigo-200 hover:bg-indigo-50'
+                                          }`}
+                                        >
+                                          {ev.move_type === 'jump_peak' ? 'Jump' : 'Turn'} @ {ev.timestamp_sec.toFixed(1)}s
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
                               </div>
                             )}
 
                             <div>
                               <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                                Transition
+                                Transition Style
                               </label>
                               <select
                                 value={clip.transition_in}
@@ -1849,10 +2159,10 @@ export function App() {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                       <div>
                         <label className="block text-xs font-semibold text-slate-700 mb-1">
-                          On-Screen Video Title Hook (First 2.6s)
+                          On-Screen Video Title Hook (First 2.4s)
                         </label>
                         <input
                           type="text"
@@ -1862,6 +2172,39 @@ export function App() {
                           }
                           className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900"
                         />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">
+                          Video Overlay Typography Style
+                        </label>
+                        <div className="flex gap-1.5">
+                          <select
+                            value={postCopy.video_title_style || 'minimal_lower_third'}
+                            onChange={(e) =>
+                              setPostCopy({
+                                ...postCopy,
+                                video_title_style: e.target.value as InstagramPostCopy['video_title_style'],
+                              })
+                            }
+                            className="flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-medium text-slate-900"
+                          >
+                            {VIDEO_TITLE_STYLE_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => void handleApplyTimelineAdjustments(true)}
+                            disabled={isUpdatingTimeline}
+                            title="Re-render MP4 with updated title style"
+                            className="px-2.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold shrink-0 cursor-pointer"
+                          >
+                            Apply
+                          </button>
+                        </div>
                       </div>
 
                       <div>

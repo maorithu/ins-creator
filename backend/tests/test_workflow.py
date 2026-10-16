@@ -160,3 +160,69 @@ def test_end_to_end_session_generation_and_exports() -> None:
     )
     assert update_resp.status_code == 200
     assert update_resp.json()["color_grade"] == "vivid_hype"
+
+
+def test_video_trim_photo_transition_styles_and_editorial_title() -> None:
+    search_resp = client.get("/api/media/search", params={"query": "dance", "source": "sample"})
+    items = search_resp.json()
+    videos = [m for m in items if m["media_type"] == MediaType.VIDEO.value]
+    assert len(videos) >= 1
+    first_vid_id = videos[0]["id"]
+
+    # Generate session with manual video portion trim
+    r = client.post(
+        "/api/sessions/generate",
+        json={
+            "search_query": "dance competition",
+            "media_source": "sample",
+            "selected_media_ids": [m["id"] for m in items[:4]],
+            "media_trims": {
+                first_vid_id: {
+                    "trim_mode": "manual",
+                    "trim_start_sec": 0.6,
+                    "trim_end_sec": 2.8,
+                }
+            },
+            "style_preset_id": "competition_stage_glory",
+            "target_duration_sec": 10.0,
+            "auto_render_mp4": False,
+            "auto_export_capcut": False,
+        },
+    )
+    assert r.status_code == 200
+    session = r.json()
+    session_id = session["session_id"]
+    clips = session["timeline_clips"]
+
+    # Check that manual trim bounds were respected for first_vid_id
+    vid_clips = [c for c in clips if c["media_id"] == first_vid_id]
+    assert len(vid_clips) >= 1
+    assert vid_clips[0]["source_in_sec"] >= 0.55
+
+    # Test new photo styles, new transitions, and editorial title styles with MP4 render
+    photo_styles = ["polaroid_frame", "tilt_up_stage", "spotlight_vignette", "soft_glow_dissolve"]
+    transitions = ["cross_dissolve", "slide_left", "light_leak_warm", "blur_dissolve"]
+    for idx, c in enumerate(clips):
+        if c["media_type"] == MediaType.PHOTO.value:
+            c["photo_effect"] = photo_styles[idx % len(photo_styles)]
+        c["transition_in"] = transitions[idx % len(transitions)]
+
+    post_copy = session["post_copy"]
+    post_copy["video_title_style"] = "frosted_pill"
+
+    update_resp = client.put(
+        f"/api/sessions/{session_id}/timeline",
+        json={
+            "timeline_clips": clips,
+            "post_copy": post_copy,
+            "color_grade": "warm_stage",
+            "re_render_mp4": True,
+        },
+    )
+    assert update_resp.status_code == 200
+    updated = update_resp.json()
+    assert updated["post_copy"]["video_title_style"] == "frosted_pill"
+    mp4_path = Path(updated["exports"]["mp4_filepath"])
+    assert mp4_path.exists()
+    assert mp4_path.stat().st_size > 10_000
+

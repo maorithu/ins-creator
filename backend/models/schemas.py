@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -30,17 +30,25 @@ class PhotoEffectType(str, Enum):
     KEN_BURNS_ZOOM_IN = "ken_burns_zoom_in"
     KEN_BURNS_ZOOM_OUT = "ken_burns_zoom_out"
     KEN_BURNS_PAN_LEFT_RIGHT = "ken_burns_pan_lr"
+    KEN_BURNS_PAN_RIGHT_LEFT = "ken_burns_pan_rl"
     KEN_BURNS_PAN_DIAG = "ken_burns_pan_diag"
+    TILT_UP_STAGE = "tilt_up_stage"
     BEAT_PULSE_ZOOM = "beat_pulse_zoom"
     SOFT_GLOW_DISSOLVE = "soft_glow_dissolve"
+    SPOTLIGHT_VIGNETTE = "spotlight_vignette"
+    POLAROID_FRAME = "polaroid_frame"
 
 
 class TransitionType(str, Enum):
     CUT_ON_BEAT = "cut_on_beat"
-    FLASH_WHITE = "flash_white"
     CROSS_DISSOLVE = "cross_dissolve"
-    ZOOM_WHIP = "zoom_whip"
+    FLASH_WHITE = "flash_white"
     DIP_TO_BLACK = "dip_to_black"
+    ZOOM_WHIP = "zoom_whip"
+    SLIDE_LEFT = "slide_left"
+    SLIDE_UP = "slide_up"
+    LIGHT_LEAK_WARM = "light_leak_warm"
+    BLUR_DISSOLVE = "blur_dissolve"
 
 
 class DanceMovementEvent(BaseModel):
@@ -88,6 +96,9 @@ class MediaItem(BaseModel):
     focal_point: BoundingBoxCenter = Field(default_factory=BoundingBoxCenter)
     source: str = "local"  # "google_photos", "local", "sample", "upload"
     query_match_score: float = 1.0
+    trim_mode: str = "auto"  # "auto" or "manual"
+    trim_start_sec: Optional[float] = None
+    trim_end_sec: Optional[float] = None
 
 
 class AudioSectionCue(BaseModel):
@@ -185,13 +196,17 @@ class InstagramPostCopy(BaseModel):
 
     hook_title_overlay: str = Field(..., description="Punchy on-screen title hook for first 2.5s of the Reel")
     ending_call_to_action: str = Field(default="Keep shining on stage ✨")
+    video_title_style: str = Field(
+        default="minimal_lower_third",
+        description="'minimal_lower_third', 'cinema_subtitle', 'frosted_pill', or 'none'",
+    )
     post_headline: str = Field(..., description="Attractive main title/headline for the Instagram post")
     caption_primary: str = Field(..., description="Full storytelling Instagram caption")
     caption_alternatives: List[Dict[str, str]] = Field(
         default_factory=list,
         description="Alternative captions (e.g. Short & Hype, Technique & Growth, Proud Parent)",
     )
-    hashtags: List[str] = Field(default_factory=list)
+    hashtags: Union[List[Dict[str, str]], List[str]] = Field(default_factory=list)
     music_credit_note: str = ""
 
 
@@ -245,6 +260,7 @@ class CreateSessionRequest(BaseModel):
     music_generation_prompt: Optional[str] = None
     target_duration_sec: float = 16.0
     selected_media_ids: Optional[List[str]] = None
+    media_trims: Optional[Dict[str, Dict[str, Any]]] = None
     auto_render_mp4: bool = True
     auto_export_capcut: bool = True
 

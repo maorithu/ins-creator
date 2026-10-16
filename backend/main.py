@@ -404,6 +404,17 @@ def generate_workflow_session(req: CreateSessionRequest) -> WorkflowSession:
         if filtered:
             all_matched = filtered
 
+    if req.media_trims:
+        for m in all_matched:
+            if m.id in req.media_trims:
+                t_cfg = req.media_trims[m.id]
+                if "trim_mode" in t_cfg:
+                    m.trim_mode = str(t_cfg["trim_mode"])
+                if t_cfg.get("trim_start_sec") is not None:
+                    m.trim_start_sec = float(t_cfg["trim_start_sec"])
+                if t_cfg.get("trim_end_sec") is not None:
+                    m.trim_end_sec = float(t_cfg["trim_end_sec"])
+
     # 2. Music Track Selection / Generation & Cue Analysis
     if req.music_generation_prompt and req.music_generation_prompt.strip():
         audio_cue_map = generate_custom_music_track(
