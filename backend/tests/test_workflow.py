@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from fastapi.testclient import TestClient
+
+from backend.main import app
+from backend.models.schemas import DanceMoveType, MediaType, PhotoEffectType
+
+
+client = TestClient(app)
+
+
+def test_health_and_presets() -> None:
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ok"
+
+    presets_resp = client.get("/api/presets")
+    assert presets_resp.status_code == 200
+    presets = presets_resp.json()
+    assert len(presets) >= 6
+    ids = {p["id"] for p in presets}
+    assert "competition_stage_glory" in ids
+    assert "lyrical_graceful_flow" in ids
+    assert "rehearsal_gritty_raw" in ids
+
+
+def test_music_tracks_and_cue_extraction() -> None:
+    r = client.get("/api/music/tracks")
+    assert r.status_code == 200
+    tracks = r.json()
+    assert len(tracks) >= 4
+    first = tracks[0]
+    assert first["bpm"] > 70
+    assert len(first["beat_times"]) >= 8
+    assert len(first["downbeat_times"]) >= 2
+    assert len(first["sections"]) >= 2
+    cue_types = {s["cue_type"] for s in first["sections"]}
+    assert "pause" in cue_types or "sustained_note" in cue_types
+
+
+def test_ai_custom_music_generation() -> None:
+    r = client.post(
+        "/api/music/generate",
+        json={
+            "prompt": "Dramatic contemporary lyrical piano build with big competition leaps",
+            "target_duration_sec": 15.0,
+        },
+    )
+    assert r.status_code == 200
+    cue_map = r.json()
+    assert cue_map["is_generated"] is True
+    assert Path(cue_map["filepath"]).exists()
+    assert len(cue_map["downbeat_times"]) >= 2
+
+
+def test_media_search_and_dance_kinematics() -> None:
+    r = client.get(
+        "/api/media/search",
+        params={"query": "daughter contemporary competition split leap and pirouette turns"},
+    )
+    assert r.status_code == 200
+    items = r.json()
+    assert len(items) >= 6
+    videos = [m for m in items if m["media_type"] == "video"]
+    photos = [m for m in items if m["media_type"] == "photo"]
+    assert len(videos) >= 3
+    assert len(photos) >= 2
+
+    # Verify jump peaks and turns are detected on the videos
+    move_types = set()
+    for v in videos:
+        assert len(v["dance_events"]) >= 1
+        for ev in v["dance_events"]:
+            move_types.add(ev["move_type"])
+    assert DanceMoveType.JUMP_PEAK.value in move_types
+    assert DanceMoveType.TURN_SPIN.value in move_types
+
+
+def test_end_to_end_session_generation_and_exports() -> None:
+    r = client.post(
+        "/api/sessions/generate",
+        json={
+            "search_query": "daughter dance competition split leap and rehearsal turns",
+            "media_source": "auto",
+            "style_preset_id": "competition_stage_glory",
+            "supplemental_directions": (
+                "Sync her highest jump peak to the main downbeat, insert a graceful stage photo "
+                "during the sustained note with Ken Burns zoom, and make the title inspiring."
+            ),
+            "target_duration_sec": 14.0,
+            "auto_render_mp4": True,
+            "auto_export_capcut": True,
+        },
+    )
+    assert r.status_code == 200
+    session = r.json()
+
+    # 1. Verify timeline clips include both downbeat-synced videos and sustained/pause photos with Ken Burns
+    clips = session["timeline_clips"]
+    assert len(clips) >= 4
+    video_clips = [c for c in clips if c["media_type"] == MediaType.VIDEO.value]
+    photo_clips = [c for c in clips if c["media_type"] == MediaType.PHOTO.value]
+    assert len(video_clips) >= 2
+    assert len(photo_clips) >= 1
+
+    # Verify photo clip has Ken Burns / visual effect and is placed on sustained note or pause
+    for pc in photo_clips:
+        assert pc["photo_effect"] is not None
+        assert "photo" in pc["synced_cue_type"]
+
+    # Verify video clip has slip-sync explanation aligning jump peak or turn to a downbeat
+    for vc in video_clips:
+        assert vc["synced_beat_timestamp"] is not None
+        assert vc["source_out_sec"] > vc["source_in_sec"]
+
+    # 2. Verify attractive Instagram post titles, captions, and hashtags
+    post_copy = session["post_copy"]
+    assert post_copy is not None
+    assert len(post_copy["hook_title_overlay"]) > 5
+    assert len(post_copy["post_headline"]) > 5
+    assert len(post_copy["caption_primary"]) > 40
+    assert len(post_copy["caption_alternatives"]) >= 2
+    assert len(post_copy["hashtags"]) >= 8
+
+    # 3. Verify rendered MP4 file exists and is non-empty
+    exports = session["exports"]
+    mp4_path = Path(exports["mp4_filepath"])
+    assert mp4_path.exists()
+    assert mp4_path.stat().st_size > 15_000
+
+    # 4. Verify CapCut Desktop Draft & FCPXML exports exist and are valid
+    capcut_dir = Path(exports["capcut_draft_path"])
+    assert (capcut_dir / "draft_content.json").exists()
+    assert (capcut_dir / "draft_meta_info.json").exists()
+    draft_json = json.loads((capcut_dir / "draft_content.json").read_text(encoding="utf-8"))
+    assert draft_json["canvas_config"]["ratio"] == "9:16"
+    assert len(draft_json["tracks"]) == 3
+
+    fcpxml_path = Path(exports["fcpxml_filepath"])
+    assert fcpxml_path.exists()
+    assert "<fcpxml" in fcpxml_path.read_text(encoding="utf-8")
+
+    # 5. Verify interactive timeline update endpoint works
+    session_id = session["session_id"]
+    clips[0]["photo_effect"] = PhotoEffectType.KEN_BURNS_PAN_DIAG.value
+    update_resp = client.put(
+        f"/api/sessions/{session_id}/timeline",
+        json={
+            "timeline_clips": clips,
+            "post_copy": post_copy,
+            "color_grade": "vivid_hype",
+            "re_render_mp4": False,
+        },
+    )
+    assert update_resp.status_code == 200
+    assert update_resp.json()["color_grade"] == "vivid_hype"
