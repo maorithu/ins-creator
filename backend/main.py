@@ -6,9 +6,10 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -54,6 +55,14 @@ from backend.services.style_presets import (
     get_preset_by_id,
 )
 from backend.services.timeline_composer import compose_beat_synced_timeline
+from backend.services import progress
+from backend.services.exporters.title_styles import (
+    HOOK_TEXT_ANIMATIONS,
+    HOOK_TEXT_STYLES,
+    frame_from_bgr_for_preview,
+    gradient_backdrop,
+    render_title_preview,
+)
 
 
 app = FastAPI(
@@ -117,6 +126,12 @@ class MusicGeneratePayload(BaseModel):
 
 
 _PKCE_VERIFIER_STORE: Dict[str, str] = {}
+
+
+def _copywriter_label() -> str:
+    if settings.gemini_api_key and len(settings.gemini_api_key.strip()) >= 20:
+        return f"Google Gemini API ({settings.gemini_model})"
+    return "Local media-grounded copywriting engine"
 
 
 @app.get("/api/health")
@@ -259,38 +274,132 @@ def list_style_presets() -> List[StylePreset]:
     return get_all_presets()
 
 
+@app.get("/api/progress/{task_id}")
+def get_task_progress(task_id: str) -> Dict[str, object]:
+    """Live progress for a long-running task started with the `X-Task-Id` header."""
+    return progress.get(task_id)
+
+
+@app.get("/api/hook-styles")
+def list_hook_text_styles() -> Dict[str, object]:
+    return {"styles": HOOK_TEXT_STYLES, "animations": HOOK_TEXT_ANIMATIONS}
+
+
+_PREVIEW_BG_CACHE: Dict[str, "object"] = {}
+
+
+def _preview_background(session_id: Optional[str], media_id: Optional[str]):
+    import cv2
+
+    key = f"{session_id}:{media_id}"
+    if key in _PREVIEW_BG_CACHE:
+        return _PREVIEW_BG_CACHE[key]
+    bg = None
+    try:
+        media: Optional[MediaItem] = None
+        source_sec = 0.0
+        if session_id:
+            sess = _load_session(session_id)
+            lookup = {m.id: m for m in sess.matched_media}
+            if media_id and media_id in lookup:
+                media = lookup[media_id]
+            elif sess.timeline_clips:
+                first = sess.timeline_clips[0]
+                media = lookup.get(first.media_id)
+                source_sec = first.source_in_sec + 0.4
+            elif sess.matched_media:
+                media = sess.matched_media[0]
+        if media and Path(media.filepath).exists():
+            if media.media_type.value == "video":
+                cap = cv2.VideoCapture(media.filepath)
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, source_sec) * 1000.0)
+                ok, frame = cap.read()
+                cap.release()
+                src = frame if ok else None
+            else:
+                src = cv2.imread(media.filepath)
+            if src is not None:
+                bg = frame_from_bgr_for_preview(src, 540, 960)
+    except HTTPException:
+        bg = None
+    except Exception:
+        bg = None
+    if bg is None:
+        bg = gradient_backdrop(540, 960)
+    if len(_PREVIEW_BG_CACHE) > 32:
+        _PREVIEW_BG_CACHE.clear()
+    _PREVIEW_BG_CACHE[key] = bg
+    return bg
+
+
+@app.get("/api/preview/hook-frame")
+def preview_hook_frame(
+    text: str = "Flying higher every 8-count",
+    style: str = "bold_center_impact",
+    position: str = "auto",
+    animation: str = "auto",
+    t: float = 1.6,
+    duration: float = 2.6,
+    closing: bool = False,
+    session_id: Optional[str] = None,
+    media_id: Optional[str] = None,
+    width: int = 540,
+) -> Response:
+    """Renders a still frame of the hook text using the exact same engine as the MP4 renderer."""
+    import cv2
+
+    bg = _preview_background(session_id, media_id)
+    frame = render_title_preview(bg, text, style, position, animation, t, duration, closing)
+    width = max(120, min(540, int(width)))
+    if width != 540:
+        frame = cv2.resize(frame, (width, int(width * 960 / 540)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to encode preview")
+    return Response(content=buf.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "max-age=300"})
+
+
 @app.get("/api/music/tracks", response_model=List[AudioCueMap])
 def list_music_tracks() -> List[AudioCueMap]:
     return ensure_builtin_music_tracks()
 
 
 @app.post("/api/music/generate", response_model=AudioCueMap)
-def create_ai_music_track(payload: MusicGeneratePayload) -> AudioCueMap:
-    return generate_custom_music_track(
-        prompt=payload.prompt,
-        target_duration_sec=payload.target_duration_sec,
-        preferred_bpm=payload.preferred_bpm,
-    )
+def create_ai_music_track(
+    payload: MusicGeneratePayload, x_task_id: Optional[str] = Header(default=None)
+) -> AudioCueMap:
+    with progress.track(x_task_id, "Generating custom music"):
+        return generate_custom_music_track(
+            prompt=payload.prompt,
+            target_duration_sec=payload.target_duration_sec,
+            preferred_bpm=payload.preferred_bpm,
+        )
 
 
 @app.post("/api/music/upload", response_model=AudioCueMap)
-async def upload_custom_music(file: UploadFile = File(...)) -> AudioCueMap:
+async def upload_custom_music(
+    file: UploadFile = File(...), x_task_id: Optional[str] = Header(default=None)
+) -> AudioCueMap:
     filename = file.filename or f"custom_audio_{uuid.uuid4().hex[:6]}.wav"
     safe_name = f"upload_{uuid.uuid4().hex[:6]}_{Path(filename).name}"
     target_path = MUSIC_DIR / safe_name
     content = await file.read()
     target_path.write_bytes(content)
 
-    track_id = f"custom_{uuid.uuid4().hex[:8]}"
-    cue_map = analyze_audio_file(
-        filepath=str(target_path),
-        track_id=track_id,
-        title=f"Uploaded Track: {Path(filename).stem}",
-        url=f"/static/music/{safe_name}",
-        genre="custom_upload",
-        is_generated=False,
-    )
-    return register_custom_music_track(cue_map)
+    def _work() -> AudioCueMap:
+        with progress.track(x_task_id, f"Analyzing {filename}"):
+            track_id = f"custom_{uuid.uuid4().hex[:8]}"
+            cue_map = analyze_audio_file(
+                filepath=str(target_path),
+                track_id=track_id,
+                title=f"Uploaded Track: {Path(filename).stem}",
+                url=f"/static/music/{safe_name}",
+                genre="custom_upload",
+                is_generated=False,
+            )
+            return register_custom_music_track(cue_map)
+
+    return await run_in_threadpool(_work)
 
 
 @app.get("/api/media/search", response_model=List[MediaItem])
@@ -299,13 +408,15 @@ def search_media_endpoint(
     source: str = "auto",
     local_folder_path: Optional[str] = None,
     google_photos_session_id: Optional[str] = None,
+    x_task_id: Optional[str] = Header(default=None),
 ) -> List[MediaItem]:
-    return search_and_ingest_media(
-        query=query,
-        media_source=source,
-        local_folder_path=local_folder_path,
-        google_photos_session_id=google_photos_session_id,
-    )
+    with progress.track(x_task_id, "Loading & analyzing media"):
+        return search_and_ingest_media(
+            query=query,
+            media_source=source,
+            local_folder_path=local_folder_path,
+            google_photos_session_id=google_photos_session_id,
+        )
 
 
 @app.post("/api/media/google-photos/picker-session")
@@ -315,22 +426,28 @@ def start_google_photos_picker_session() -> Dict[str, object]:
 
 
 @app.get("/api/media/google-photos/picker-session/{session_id}")
-def poll_google_photos_picker_session(session_id: str) -> Dict[str, object]:
+def poll_google_photos_picker_session(
+    session_id: str, x_task_id: Optional[str] = Header(default=None)
+) -> Dict[str, object]:
     """Polls the Google Photos Picker session; when mediaItemsSet is True, automatically downloads & analyzes the picked items."""
     client = GooglePhotosClient()
     status = client.get_picker_session_status(picker_session_id=session_id)
     if status.get("mediaItemsSet"):
-        items = client.fetch_media_by_query_or_session(picker_session_id=session_id)
+        with progress.track(x_task_id, "Importing from Google Photos"):
+            items = client.fetch_media_by_query_or_session(picker_session_id=session_id)
         status["importedItems"] = [item.model_dump() for item in items]
         status["importedCount"] = len(items)
     return status
 
 
 @app.post("/api/media/google-photos/import", response_model=List[MediaItem])
-def import_from_google_photos_session(session_id: Optional[str] = None) -> List[MediaItem]:
+def import_from_google_photos_session(
+    session_id: Optional[str] = None, x_task_id: Optional[str] = Header(default=None)
+) -> List[MediaItem]:
     """Manually triggers downloading and analyzing media from the latest Google Photos Picker session."""
     client = GooglePhotosClient()
-    return client.fetch_media_by_query_or_session(picker_session_id=session_id)
+    with progress.track(x_task_id, "Importing from Google Photos"):
+        return client.fetch_media_by_query_or_session(picker_session_id=session_id)
 
 
 @app.post("/api/media/clear")
@@ -348,12 +465,13 @@ def clear_imported_and_uploaded_media() -> Dict[str, object]:
 
 
 @app.post("/api/media/reanalyze", response_model=List[MediaItem])
-def reanalyze_imported_media() -> List[MediaItem]:
+def reanalyze_imported_media(x_task_id: Optional[str] = Header(default=None)) -> List[MediaItem]:
     """Clears in-memory analysis cache and re-extracts EXIF, CV kinematics, sharpness/quality, and AI metadata tags."""
     from backend.services.media_ingest import _ANALYZED_MEDIA_CACHE
 
     _ANALYZED_MEDIA_CACHE.clear()
-    return search_and_ingest_media(query="dance event", media_source="auto")
+    with progress.track(x_task_id, "Re-analyzing media metadata"):
+        return search_and_ingest_media(query="dance event", media_source="auto")
 
 
 
@@ -361,6 +479,7 @@ def reanalyze_imported_media() -> List[MediaItem]:
 async def upload_media_files(
     files: List[UploadFile] = File(...),
     query: str = Form(default="dance event"),
+    x_task_id: Optional[str] = Header(default=None),
 ) -> List[MediaItem]:
     for f in files:
         fname = Path(f.filename or f"media_{uuid.uuid4().hex[:6]}.jpg").name
@@ -368,11 +487,22 @@ async def upload_media_files(
         data = await f.read()
         dst.write_bytes(data)
 
-    return scan_local_directory(str(UPLOADS_DIR), query=query)
+    def _work() -> List[MediaItem]:
+        with progress.track(x_task_id, f"Analyzing {len(files)} uploaded file(s)"):
+            return scan_local_directory(str(UPLOADS_DIR), query=query)
+
+    return await run_in_threadpool(_work)
 
 
 @app.post("/api/sessions/generate", response_model=WorkflowSession)
-def generate_workflow_session(req: CreateSessionRequest) -> WorkflowSession:
+def generate_workflow_session(
+    req: CreateSessionRequest, x_task_id: Optional[str] = Header(default=None)
+) -> WorkflowSession:
+    with progress.track(x_task_id, "Generating Reel & Post"):
+        return _generate_workflow_session_impl(req)
+
+
+def _generate_workflow_session_impl(req: CreateSessionRequest) -> WorkflowSession:
     """
     Executes the full automated workflow:
     1. Fetches and ranks photos & videos matching `req.search_query` from Google Photos / Local / Sample
@@ -392,12 +522,14 @@ def generate_workflow_session(req: CreateSessionRequest) -> WorkflowSession:
     )
 
     # 1. Media Ingestion & Dance Kinematics Analysis
-    all_matched = search_and_ingest_media(
-        query=req.search_query,
-        media_source=req.media_source,
-        local_folder_path=req.local_folder_path,
-        google_photos_session_id=req.google_photos_session_id,
-    )
+    progress.update(1, "Gathering your selected media", service="Local media cache")
+    with progress.scope(1, 30):
+        all_matched = search_and_ingest_media(
+            query=req.search_query,
+            media_source=req.media_source,
+            local_folder_path=req.local_folder_path,
+            google_photos_session_id=req.google_photos_session_id,
+        )
     if req.selected_media_ids:
         selected_set = set(req.selected_media_ids)
         filtered = [m for m in all_matched if m.id in selected_set]
@@ -416,17 +548,26 @@ def generate_workflow_session(req: CreateSessionRequest) -> WorkflowSession:
                     m.trim_end_sec = float(t_cfg["trim_end_sec"])
 
     # 2. Music Track Selection / Generation & Cue Analysis
+    progress.update(30, "Loading soundtrack beat & cue map", service="Librosa cue map cache")
     if req.music_generation_prompt and req.music_generation_prompt.strip():
-        audio_cue_map = generate_custom_music_track(
-            prompt=req.music_generation_prompt,
-            target_duration_sec=req.target_duration_sec,
-        )
-    elif req.music_track_id:
-        audio_cue_map = get_music_track_by_id(req.music_track_id)
+        with progress.scope(30, 40):
+            audio_cue_map = generate_custom_music_track(
+                prompt=req.music_generation_prompt,
+                target_duration_sec=req.target_duration_sec,
+            )
     else:
-        audio_cue_map = get_music_track_by_id(active_preset.default_music_genre)
+        wanted_track = req.music_track_id or active_preset.default_music_genre
+        try:
+            audio_cue_map = get_music_track_by_id(wanted_track)
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Music track '{wanted_track}' is no longer available. Please re-select or re-upload it in Step 3.",
+            )
+    progress.update(40, f"Using soundtrack “{audio_cue_map.title}”", service="Librosa cue map cache")
 
     # 3. Beat-Synced Choreographic Timeline Assembly
+    progress.update(42, "Syncing jump & turn peaks to downbeats; placing photos on pauses", service="Beat-sync timeline composer")
     target_dur = req.target_duration_sec or active_preset.target_duration_sec
     timeline_clips = compose_beat_synced_timeline(
         matched_media=all_matched,
@@ -437,6 +578,7 @@ def generate_workflow_session(req: CreateSessionRequest) -> WorkflowSession:
     )
 
     # 4. Attractive Instagram Titles, Captions & Hashtags
+    progress.update(48, "Writing personalized hook, headline, captions & hashtags", service=_copywriter_label())
     post_copy = generate_instagram_post_copy(
         search_query=req.search_query,
         style_preset=active_preset,
@@ -451,20 +593,22 @@ def generate_workflow_session(req: CreateSessionRequest) -> WorkflowSession:
 
     # 5. Render Direct MP4 Video
     if req.auto_render_mp4:
-        mp4_path = render_session_mp4(
-            session_id=session_id,
-            timeline_clips=timeline_clips,
-            media_lookup=media_lookup,
-            audio_cue_map=audio_cue_map,
-            post_copy=post_copy,
-            color_grade=active_preset.color_grade_preset,
-        )
+        with progress.scope(58, 92):
+            mp4_path = render_session_mp4(
+                session_id=session_id,
+                timeline_clips=timeline_clips,
+                media_lookup=media_lookup,
+                audio_cue_map=audio_cue_map,
+                post_copy=post_copy,
+                color_grade=active_preset.color_grade_preset,
+            )
         exports_info.mp4_filepath = str(mp4_path)
         exports_info.mp4_url = f"/static/exports/{mp4_path.name}?t={int(datetime.datetime.now().timestamp())}"
         exports_info.last_rendered_at = created_at
 
     # 6. Export Editable CapCut Desktop Draft & FCPXML
     if req.auto_export_capcut:
+        progress.update(93, "Exporting editable CapCut draft & FCPXML", service="CapCut Desktop draft writer + FCPXML 1.10")
         project_title = f"DanceReel_{active_preset.name.replace(' ', '_')}_{session_id}"
         draft_dir, zip_path, installed = export_capcut_draft(
             session_id=session_id,
@@ -528,9 +672,14 @@ def get_session(session_id: str) -> WorkflowSession:
 
 @app.put("/api/sessions/{session_id}/timeline", response_model=WorkflowSession)
 def update_session_timeline(
-    session_id: str, req: UpdateTimelineRequest
+    session_id: str, req: UpdateTimelineRequest, x_task_id: Optional[str] = Header(default=None)
 ) -> WorkflowSession:
     """Updates the interactive timeline, post copy, or color grade, and re-exports CapCut/FCPXML/MP4."""
+    with progress.track(x_task_id, "Re-rendering MP4" if req.re_render_mp4 else "Saving timeline"):
+        return _update_session_timeline_impl(session_id, req)
+
+
+def _update_session_timeline_impl(session_id: str, req: UpdateTimelineRequest) -> WorkflowSession:
     session = _load_session(session_id)
 
     # Recompute sequential start/end times if clip durations or order changed
@@ -555,6 +704,7 @@ def update_session_timeline(
             media_lookup[m.id] = m
 
     project_title = f"DanceReel_{session.session_id}"
+    progress.update(4, "Updating CapCut draft & FCPXML", service="CapCut Desktop draft writer + FCPXML 1.10")
     draft_dir, zip_path, installed = export_capcut_draft(
         session_id=session.session_id,
         project_title=project_title,
@@ -579,14 +729,15 @@ def update_session_timeline(
     session.exports.fcpxml_url = f"/static/exports/{fcpxml_path.name}"
 
     if req.re_render_mp4:
-        mp4_path = render_session_mp4(
-            session_id=session.session_id,
-            timeline_clips=session.timeline_clips,
-            media_lookup=media_lookup,
-            audio_cue_map=session.audio_cue_map,
-            post_copy=session.post_copy,
-            color_grade=session.color_grade,
-        )
+        with progress.scope(10, 100):
+            mp4_path = render_session_mp4(
+                session_id=session.session_id,
+                timeline_clips=session.timeline_clips,
+                media_lookup=media_lookup,
+                audio_cue_map=session.audio_cue_map,
+                post_copy=session.post_copy,
+                color_grade=session.color_grade,
+            )
         session.exports.mp4_filepath = str(mp4_path)
         session.exports.mp4_url = (
             f"/static/exports/{mp4_path.name}?t={int(datetime.datetime.now().timestamp())}"
@@ -626,9 +777,15 @@ class RegeneratePostCopyPayload(BaseModel):
 
 @app.post("/api/sessions/{session_id}/post-copy", response_model=WorkflowSession)
 def regenerate_session_post_copy(
-    session_id: str, payload: RegeneratePostCopyPayload
+    session_id: str, payload: RegeneratePostCopyPayload, x_task_id: Optional[str] = Header(default=None)
 ) -> WorkflowSession:
     """Regenerates personalized Instagram post titles, captions, and hashtags grounded in the session's media and a custom prompt."""
+    with progress.track(x_task_id, "Regenerating post copy"):
+        progress.update(10, "Writing personalized hook, headline, captions & hashtags", service=_copywriter_label())
+        return _regenerate_post_copy_impl(session_id, payload)
+
+
+def _regenerate_post_copy_impl(session_id: str, payload: RegeneratePostCopyPayload) -> WorkflowSession:
     session = _load_session(session_id)
     base_preset = get_preset_by_id(session.style_preset_id)
     active_preset = apply_supplemental_directions_to_preset(
@@ -643,6 +800,12 @@ def regenerate_session_post_copy(
         audio_cue_map=session.audio_cue_map,
         custom_prompt=payload.custom_prompt,
     )
+    if session.post_copy is not None:
+        # Keep the user's chosen on-screen text styling when only the words are regenerated
+        new_copy.video_title_style = session.post_copy.video_title_style
+        new_copy.hook_text_animation = session.post_copy.hook_text_animation
+        new_copy.hook_text_position = session.post_copy.hook_text_position
+        new_copy.hook_duration_sec = session.post_copy.hook_duration_sec
     session.post_copy = new_copy
     if session.timeline_clips:
         session.timeline_clips[0].text_overlay = new_copy.hook_title_overlay

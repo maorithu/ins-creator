@@ -150,7 +150,7 @@ def _extract_exif_and_enrich_metadata(item: MediaItem, bgr_frame: Optional[np.nd
     used_gemini = False
     if (
         settings.gemini_api_key
-        and settings.gemini_api_key.startswith("AIza")
+        and len(settings.gemini_api_key.strip()) >= 20
         and getattr(_extract_exif_and_enrich_metadata, "_gemini_ok", True)
         and (
             not item.semantic_caption

@@ -25,6 +25,9 @@ import {
   TimelineClip,
   WorkflowSession,
 } from './types';
+import { ProgressPanel, useTaskRunner, xhrUpload } from './ProgressPanel';
+import { MusicCuePreview } from './MusicCuePreview';
+import { HookStyleStudio } from './HookStyleStudio';
 
 const PHOTO_EFFECT_OPTIONS = [
   { value: 'ken_burns_zoom_in', label: 'Slow Cinematic Zoom-In (Focus Dancer)' },
@@ -51,12 +54,22 @@ const TRANSITION_OPTIONS = [
   { value: 'blur_dissolve', label: 'Defocus Rack-Focus Dissolve' },
 ];
 
-const VIDEO_TITLE_STYLE_OPTIONS = [
-  { value: 'minimal_lower_third', label: 'Minimal Editorial Lower-Third (Default)' },
-  { value: 'cinema_subtitle', label: 'Clean Cinema Subtitle (No Box)' },
-  { value: 'frosted_pill', label: 'Modern Frosted Glass Pill' },
-  { value: 'none', label: 'No Text on Video (100% Clean Video)' },
-];
+async function fetchJson<T>(url: string, init: RequestInit = {}, taskId?: string): Promise<T> {
+  const headers = new Headers(init.headers || {});
+  if (taskId) headers.set('X-Task-Id', taskId);
+  const res = await fetch(url, { ...init, headers });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body);
+    } catch {
+      detail = await res.text().catch(() => '');
+    }
+    throw new Error(detail || `HTTP ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
 
 const WORKFLOW_STEPS = [
   {
@@ -130,6 +143,10 @@ export function App() {
   const [googleTokenInput, setGoogleTokenInput] = useState('');
   const [googlePhotosConnected, setGooglePhotosConnected] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const { task, runTask, showWaiting, finish: finishTask, dismiss: dismissTask } =
+    useTaskRunner(setStatusMessage);
+  const [autoPlayMusic, setAutoPlayMusic] = useState(false);
+  const pickerPollBusyRef = useRef(false);
 
   useEffect(() => {
     void loadInitialCatalog();
@@ -208,14 +225,27 @@ export function App() {
     stopPickerPolling();
     setActivePickerSessionId(sessionId);
     setIsWaitingForGooglePicker(true);
+    const pickerTaskId = `gp_${sessionId}`;
+    showWaiting(
+      pickerTaskId,
+      'Importing from Google Photos',
+      'Waiting for you to pick photos & videos in the Google Photos tab, then click “Done”…',
+      'Google Photos Picker API'
+    );
 
     pickerPollTimerRef.current = window.setInterval(async () => {
+      // Never overlap polls: one poll may be busy downloading & analyzing the picked items
+      if (pickerPollBusyRef.current) return;
+      pickerPollBusyRef.current = true;
       try {
-        const res = await fetch(`/api/media/google-photos/picker-session/${sessionId}`);
+        const res = await fetch(`/api/media/google-photos/picker-session/${sessionId}`, {
+          headers: { 'X-Task-Id': pickerTaskId },
+        });
         if (!res.ok) return;
         const data = await res.json();
         if (data.mediaItemsSet && Array.isArray(data.importedItems)) {
           stopPickerPolling();
+          finishTask(pickerTaskId, true, `Imported ${data.importedItems.length} item(s)`);
           const imported: MediaItem[] = data.importedItems;
           if (imported.length > 0) {
             setMatchedMedia((prev) => {
@@ -237,6 +267,8 @@ export function App() {
         }
       } catch (err) {
         console.error('Polling error:', err);
+      } finally {
+        pickerPollBusyRef.current = false;
       }
     }, 3000);
   }
@@ -268,13 +300,17 @@ export function App() {
   async function handleManualFetchFromGooglePicker() {
     setIsImportingMedia(true);
     setStatusMessage('Downloading and analyzing your selected items from Google Photos...');
+    stopPickerPolling();
     try {
       const url = activePickerSessionId
         ? `/api/media/google-photos/import?session_id=${encodeURIComponent(activePickerSessionId)}`
         : '/api/media/google-photos/import';
-      const res = await fetch(url, { method: 'POST' });
-      const imported: MediaItem[] = await res.json();
-      stopPickerPolling();
+      const imported = await runTask(
+        'Importing from Google Photos',
+        { stage: 'Contacting Google Photos…', service: 'Google Photos Picker API' },
+        (taskId) => fetchJson<MediaItem[]>(url, { method: 'POST' }, taskId),
+        'Import complete'
+      );
       if (imported.length > 0) {
         setMatchedMedia((prev) => {
           const nonSample = prev.filter((p) => p.source !== 'sample');
@@ -332,12 +368,19 @@ export function App() {
     setStatusMessage(
       `Importing and analyzing dance movements on ${validFiles.length} file(s)...`
     );
+    const totalMb = validFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024);
     try {
-      const res = await fetch('/api/media/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      const uploaded: MediaItem[] = await res.json();
+      const uploaded = await runTask(
+        `Importing ${validFiles.length} file(s)`,
+        {
+          stage: `Uploading ${validFiles.length} file(s) (${totalMb.toFixed(1)} MB)`,
+          service: 'Browser → local Ins-Creator server',
+          uploadShare: 0.3,
+        },
+        (taskId, onUpload) =>
+          xhrUpload<MediaItem[]>('/api/media/upload', formData, { 'X-Task-Id': taskId }, onUpload),
+        'Import & analysis complete'
+      );
       setMatchedMedia((prev) => {
         const nonSample = prev.filter((p) => p.source !== 'sample');
         const existingIds = new Set(uploaded.map((u) => u.id));
@@ -362,8 +405,11 @@ export function App() {
     setIsImportingMedia(true);
     setStatusMessage('Loading demo dance event videos & photos...');
     try {
-      const res = await fetch('/api/media/search?source=sample');
-      const data: MediaItem[] = await res.json();
+      const data = await runTask(
+        'Loading demo media',
+        { stage: 'Preparing demo dance clips & photos', service: 'Local sample dataset' },
+        (taskId) => fetchJson<MediaItem[]>('/api/media/search?source=sample', {}, taskId)
+      );
       setMatchedMedia(data);
       setSelectedMediaIds(new Set(data.map((m) => m.id)));
       setStatusMessage(`Loaded ${data.length} demo dance items.`);
@@ -386,8 +432,11 @@ export function App() {
     setIsImportingMedia(true);
     setStatusMessage('Analyzing media EXIF, quality, focal points, and dance metadata...');
     try {
-      const res = await fetch('/api/media/reanalyze', { method: 'POST' });
-      const data: MediaItem[] = await res.json();
+      const data = await runTask(
+        'Re-analyzing media metadata',
+        { stage: 'Clearing analysis cache', service: 'Local media cache' },
+        (taskId) => fetchJson<MediaItem[]>('/api/media/reanalyze', { method: 'POST' }, taskId)
+      );
       setMatchedMedia(data);
       setStatusMessage(`Analyzed and applied metadata to ${data.length} media item(s).`);
     } catch (err) {
@@ -441,21 +490,23 @@ export function App() {
     setIsGeneratingMusic(true);
     setStatusMessage(`Analyzing "${file.name}" for downbeats, sustained notes, and pauses...`);
     try {
-      const res = await fetch('/api/music/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        setStatusMessage(`Failed to analyze audio file: ${errText.slice(0, 120)}`);
-        return;
-      }
-      const cueMap: AudioCueMap = await res.json();
+      const cueMap = await runTask(
+        `Analyzing “${file.name}”`,
+        {
+          stage: `Uploading ${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+          service: 'Browser → local Ins-Creator server',
+          uploadShare: 0.25,
+        },
+        (taskId, onUpload) =>
+          xhrUpload<AudioCueMap>('/api/music/upload', formData, { 'X-Task-Id': taskId }, onUpload),
+        'Track analyzed & selected'
+      );
       setMusicTracks((prev) => [
         cueMap,
         ...prev.filter((t) => t.track_id !== cueMap.track_id),
       ]);
       setSelectedMusicId(cueMap.track_id);
+      setAutoPlayMusic(true);
       setStatusMessage(
         `Uploaded and selected "${cueMap.title}" (${cueMap.bpm} BPM, ${cueMap.downbeat_times.length} downbeats).`
       );
@@ -473,24 +524,27 @@ export function App() {
     setIsGeneratingMusic(true);
     setStatusMessage(`Generating custom soundtrack for "${customMusicPrompt}"...`);
     try {
-      const res = await fetch('/api/music/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: customMusicPrompt,
-          target_duration_sec: targetDurationSec,
-        }),
-      });
-      if (!res.ok) {
-        setStatusMessage('Failed to generate custom music track.');
-        return;
-      }
-      const cueMap: AudioCueMap = await res.json();
+      const cueMap = await runTask(
+        'Generating custom music',
+        { stage: `Composing “${customMusicPrompt.slice(0, 40)}”`, service: 'Music generator' },
+        (taskId) =>
+          fetchJson<AudioCueMap>(
+            '/api/music/generate',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt: customMusicPrompt, target_duration_sec: targetDurationSec }),
+            },
+            taskId
+          ),
+        'Track generated & selected'
+      );
       setMusicTracks((prev) => [
         cueMap,
         ...prev.filter((t) => t.track_id !== cueMap.track_id),
       ]);
       setSelectedMusicId(cueMap.track_id);
+      setAutoPlayMusic(true);
       setStatusMessage(`Generated and selected "${cueMap.title}" (${cueMap.bpm} BPM).`);
     } catch (err) {
       console.error(err);
@@ -558,10 +612,7 @@ export function App() {
       'Aligning jump peaks & turns to measure downbeats, placing photos on sustained notes/pauses, rendering 9:16 MP4, and generating CapCut draft...'
     );
     try {
-      const res = await fetch('/api/sessions/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const requestBody = JSON.stringify({
           search_query: supplementalDirections || 'dance event',
           media_source: 'auto',
           style_preset_id: selectedPresetId,
@@ -573,9 +624,18 @@ export function App() {
           media_trims: Object.keys(mediaTrims).length > 0 ? mediaTrims : null,
           auto_render_mp4: true,
           auto_export_capcut: true,
-        }),
-      });
-      const sess: WorkflowSession = await res.json();
+        });
+      const sess = await runTask(
+        'Generating Reel & Post',
+        { stage: 'Starting workflow', service: 'Ins-Creator pipeline' },
+        (taskId) =>
+          fetchJson<WorkflowSession>(
+            '/api/sessions/generate',
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: requestBody },
+            taskId
+          ),
+        'Reel, post copy & CapCut draft ready'
+      );
       setSession(sess);
       setTimelineClips(sess.timeline_clips);
       setPostCopy(sess.post_copy || null);
@@ -599,17 +659,26 @@ export function App() {
         : 'Saving timeline changes to CapCut draft and FCPXML...'
     );
     try {
-      const res = await fetch(`/api/sessions/${session.session_id}/timeline`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          timeline_clips: timelineClips,
-          post_copy: postCopy,
-          color_grade: session.color_grade,
-          re_render_mp4: reRenderMp4,
-        }),
-      });
-      const updated: WorkflowSession = await res.json();
+      const updated = await runTask(
+        reRenderMp4 ? 'Re-rendering MP4' : 'Saving timeline',
+        { stage: 'Applying timeline changes', service: 'Ins-Creator pipeline' },
+        (taskId) =>
+          fetchJson<WorkflowSession>(
+            `/api/sessions/${session.session_id}/timeline`,
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                timeline_clips: timelineClips,
+                post_copy: postCopy,
+                color_grade: session.color_grade,
+                re_render_mp4: reRenderMp4,
+              }),
+            },
+            taskId
+          ),
+        reRenderMp4 ? 'Video re-rendered' : 'Timeline saved'
+      );
       setSession(updated);
       setTimelineClips(updated.timeline_clips);
       setPostCopy(updated.post_copy || null);
@@ -638,18 +707,21 @@ export function App() {
         : 'Regenerating personalized post copy from media metadata...'
     );
     try {
-      const res = await fetch(`/api/sessions/${session.session_id}/post-copy`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          custom_prompt: promptToUse,
-        }),
-      });
-      if (!res.ok) {
-        setStatusMessage('Failed to regenerate post copy.');
-        return;
-      }
-      const updated: WorkflowSession = await res.json();
+      const updated = await runTask(
+        'Regenerating post copy',
+        { stage: 'Writing personalized captions', service: 'Copywriter' },
+        (taskId) =>
+          fetchJson<WorkflowSession>(
+            `/api/sessions/${session.session_id}/post-copy`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ custom_prompt: promptToUse }),
+            },
+            taskId
+          ),
+        'Post copy updated'
+      );
       setSession(updated);
       setTimelineClips(updated.timeline_clips);
       setPostCopy(updated.post_copy || null);
@@ -724,6 +796,7 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
+      <ProgressPanel task={task} onDismiss={dismissTask} />
       {/* Clean Professional Top Navigation Bar */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-30">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -1514,9 +1587,23 @@ export function App() {
                                 </div>
                               </div>
                             </div>
-                            <span className="text-[11px] font-mono text-slate-500">
-                              {track.duration_sec.toFixed(0)}s
-                            </span>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="text-[11px] font-mono text-slate-500">
+                                {track.duration_sec.toFixed(0)}s
+                              </span>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedMusicId(track.track_id);
+                                  setAutoPlayMusic(true);
+                                }}
+                                aria-label={`Preview ${track.title}`}
+                                className="w-7 h-7 rounded-full border border-slate-300 bg-white hover:bg-slate-100 flex items-center justify-center cursor-pointer"
+                              >
+                                <Play className="w-3 h-3 ml-0.5 text-slate-800" />
+                              </button>
+                            </div>
                           </div>
                         );
                       })}
@@ -1571,114 +1658,12 @@ export function App() {
                     Active Track Preview & Cue Structure
                   </label>
                   {activeCueMap && (
-                    <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
-                      <div>
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <div className="text-xs font-semibold text-slate-900">
-                            {activeCueMap.title}
-                          </div>
-                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-slate-900 text-white shrink-0">
-                            {activeCueMap.bpm} BPM • {activeCueMap.duration_sec.toFixed(1)}s
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-slate-500 mb-2">
-                          Genre: <span className="font-medium text-slate-700">{activeCueMap.genre}</span> •{' '}
-                          {activeCueMap.downbeat_times.length} measure downbeats •{' '}
-                          {activeCueMap.beat_times.length} total beats
-                        </div>
-                        <audio
-                          key={activeCueMap.track_id}
-                          controls
-                          src={activeCueMap.url}
-                          className="w-full h-9"
-                        />
-                      </div>
-
-                      {/* Clean Beat & Section Cue Map */}
-                      <div>
-                        <div className="flex items-center justify-between text-[11px] text-slate-600 mb-1.5">
-                          <span>Dark ticks = Downbeats (Jump/Turn Sync)</span>
-                          <span>Shaded = Sustained/Pause (Photos)</span>
-                        </div>
-                        <div className="relative h-20 rounded-lg bg-white border border-slate-200 p-2 overflow-hidden flex flex-col justify-end">
-                          {activeCueMap.sections.map((sec, idx) => {
-                            const previewSpan = Math.max(targetDurationSec, activeCueMap.duration_sec, 10);
-                            const leftPct = Math.min(95, (sec.start_sec / previewSpan) * 100);
-                            const widthPct = Math.max(5, (sec.duration_sec / previewSpan) * 100);
-                            if (leftPct >= 100) return null;
-                            return (
-                              <div
-                                key={idx}
-                                style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
-                                className="absolute top-0 bottom-0 bg-slate-200/70 border-x border-slate-300 flex items-start justify-center pt-1"
-                              >
-                                <span className="text-[9px] font-semibold uppercase text-slate-700 bg-white/90 px-1 rounded">
-                                  {sec.cue_type === 'pause' ? 'Pause' : 'Sustained'}
-                                </span>
-                              </div>
-                            );
-                          })}
-
-                          {activeCueMap.downbeat_times.map((db, idx) => {
-                            const previewSpan = Math.max(targetDurationSec, activeCueMap.duration_sec, 10);
-                            const leftPct = (db / previewSpan) * 100;
-                            if (leftPct > 100) return null;
-                            return (
-                              <div
-                                key={idx}
-                                style={{ left: `${leftPct}%` }}
-                                className="absolute top-4 bottom-0 w-[1.5px] bg-slate-900 z-10"
-                                title={`Downbeat @ ${db}s`}
-                              />
-                            );
-                          })}
-
-                          <div className="flex items-end gap-[2px] h-10 w-full z-0">
-                            {activeCueMap.energy_envelope
-                              .slice(0, 240)
-                              .map((val, idx) => (
-                                <div
-                                  key={idx}
-                                  style={{ height: `${Math.max(12, Math.round(val * 100))}%` }}
-                                  className="flex-1 bg-slate-400/70 rounded-t-sm"
-                                />
-                              ))}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="space-y-1.5 text-xs text-slate-600">
-                        <div className="font-semibold text-slate-800">
-                          Measure Downbeats (Jump / Turn Sync Points):
-                        </div>
-                        <div className="flex flex-wrap gap-1">
-                          {activeCueMap.downbeat_times.slice(0, 10).map((db, idx) => (
-                            <span
-                              key={idx}
-                              className="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-700"
-                            >
-                              {db.toFixed(2)}s
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div className="space-y-1.5 text-xs text-slate-600">
-                        <div className="font-semibold text-slate-800">
-                          Detected Photo Insertion Cues:
-                        </div>
-                        {activeCueMap.sections.map((s, i) => (
-                          <div key={i} className="flex items-center justify-between text-[11px]">
-                            <span className="capitalize font-medium text-slate-700">
-                              • {s.cue_type.replace('_', ' ')}
-                            </span>
-                            <span className="font-mono text-slate-500">
-                              {s.start_sec.toFixed(1)}s – {s.end_sec.toFixed(1)}s ({s.duration_sec.toFixed(1)}s)
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                    <MusicCuePreview
+                      cueMap={activeCueMap}
+                      targetDurationSec={targetDurationSec}
+                      autoPlay={autoPlayMusic}
+                      onAutoPlayConsumed={() => setAutoPlayMusic(false)}
+                    />
                   )}
                 </div>
               </div>
@@ -2162,7 +2147,7 @@ export function App() {
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                       <div>
                         <label className="block text-xs font-semibold text-slate-700 mb-1">
-                          On-Screen Video Title Hook (First 2.4s)
+                          On-Screen Hook Text
                         </label>
                         <input
                           type="text"
@@ -2176,35 +2161,16 @@ export function App() {
 
                       <div>
                         <label className="block text-xs font-semibold text-slate-700 mb-1">
-                          Video Overlay Typography Style
+                          Closing Line (last 2s)
                         </label>
-                        <div className="flex gap-1.5">
-                          <select
-                            value={postCopy.video_title_style || 'minimal_lower_third'}
-                            onChange={(e) =>
-                              setPostCopy({
-                                ...postCopy,
-                                video_title_style: e.target.value as InstagramPostCopy['video_title_style'],
-                              })
-                            }
-                            className="flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-medium text-slate-900"
-                          >
-                            {VIDEO_TITLE_STYLE_OPTIONS.map((opt) => (
-                              <option key={opt.value} value={opt.value}>
-                                {opt.label}
-                              </option>
-                            ))}
-                          </select>
-                          <button
-                            type="button"
-                            onClick={() => void handleApplyTimelineAdjustments(true)}
-                            disabled={isUpdatingTimeline}
-                            title="Re-render MP4 with updated title style"
-                            className="px-2.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold shrink-0 cursor-pointer"
-                          >
-                            Apply
-                          </button>
-                        </div>
+                        <input
+                          type="text"
+                          value={postCopy.ending_call_to_action}
+                          onChange={(e) =>
+                            setPostCopy({ ...postCopy, ending_call_to_action: e.target.value })
+                          }
+                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900"
+                        />
                       </div>
 
                       <div>
@@ -2221,6 +2187,14 @@ export function App() {
                         />
                       </div>
                     </div>
+
+                    <HookStyleStudio
+                      postCopy={postCopy}
+                      setPostCopy={setPostCopy}
+                      sessionId={session?.session_id}
+                      onApply={() => void handleApplyTimelineAdjustments(true)}
+                      isRendering={isUpdatingTimeline}
+                    />
 
                     <div>
                       <div className="flex items-center justify-between mb-1.5">

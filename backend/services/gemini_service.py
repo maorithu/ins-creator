@@ -139,7 +139,7 @@ def generate_instagram_post_copy(
     bpm_val = int(audio_cue_map.bpm) if audio_cue_map else 120
 
     # Try live Gemini API first if a valid AI Studio key (AIza...) is configured
-    if settings.gemini_api_key and settings.gemini_api_key.startswith("AIza"):
+    if settings.gemini_api_key and len(settings.gemini_api_key.strip()) >= 20:
         try:
             from google import genai
 

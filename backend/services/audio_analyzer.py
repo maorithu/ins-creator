@@ -6,6 +6,109 @@ import librosa
 import numpy as np
 
 from backend.models.schemas import AudioCueMap, AudioSectionCue
+from backend.services import progress
+
+
+def _smooth(x: np.ndarray, win: int) -> np.ndarray:
+    if win <= 1 or len(x) < win:
+        return np.asarray(x, dtype=np.float64)
+    kernel = np.ones(win, dtype=np.float64) / float(win)
+    return np.convolve(np.asarray(x, dtype=np.float64), kernel, mode="same")
+
+
+def _runs(mask: np.ndarray, min_len: int) -> List[tuple]:
+    runs: List[tuple] = []
+    start: Optional[int] = None
+    for i, v in enumerate(mask):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= min_len:
+                runs.append((start, i))
+            start = None
+    if start is not None and len(mask) - start >= min_len:
+        runs.append((start, len(mask)))
+    return runs
+
+
+def _detect_photo_sections(
+    grid_times: np.ndarray,
+    energy: np.ndarray,
+    perc: np.ndarray,
+    harm_ratio: np.ndarray,
+    duration_sec: float,
+) -> List[AudioSectionCue]:
+    """
+    Finds photo-friendly windows relative to *this* track's own dynamics:
+    - Pause / breath: smoothed loudness well below the track's median level (>= 0.6s)
+    - Sustained note: percussion drops far below its usual level while harmony keeps ringing (>= 1.0s)
+    The strongest, non-overlapping candidates are kept (about one per 7 seconds of music).
+    """
+    n = len(grid_times)
+    if n < 20:
+        return []
+    step = float(grid_times[1] - grid_times[0]) if n > 1 else 0.1
+    e_s = _smooth(energy, 5)
+    p_norm = np.asarray(perc, dtype=np.float64) / (float(np.max(perc)) + 1e-9)
+    p_s = _smooth(p_norm, 7)  # ~0.7s window bridges the gaps between individual drum hits
+    h_s = _smooth(harm_ratio, 5)
+    edge = 5
+
+    med_e = float(np.median(e_s))
+    pause_thr = max(0.06, min(0.30, med_e * 0.45))
+    pause_mask = e_s < pause_thr
+    pause_mask[:edge] = False
+    pause_mask[-edge:] = False
+
+    p_med = float(np.median(p_s)) + 1e-9
+    sus_mask = (p_s < p_med * 0.45) & (e_s >= pause_thr) & (h_s >= float(np.percentile(h_s, 60)))
+    sus_mask &= ~pause_mask
+    sus_mask[:edge] = False
+    sus_mask[-edge:] = False
+
+    candidates: List[tuple] = []
+    for a, b in _runs(pause_mask, 6):
+        seg_e = float(np.mean(e_s[a:b]))
+        depth = max(0.05, 1.0 - seg_e / (med_e + 1e-9))
+        candidates.append(("pause", a, b, seg_e, depth * (b - a)))
+    for a, b in _runs(sus_mask, 10):
+        seg_e = float(np.mean(e_s[a:b]))
+        quiet = max(0.05, 1.0 - float(np.mean(p_s[a:b])) / p_med)
+        candidates.append(("sustained_note", a, b, seg_e, quiet * (b - a)))
+
+    max_sections = max(2, min(8, int(duration_sec / 7.0) + 1))
+    min_gap = int(round(1.0 / step))
+    candidates.sort(key=lambda c: c[4], reverse=True)
+    picked: List[tuple] = []
+    for c in candidates:
+        if len(picked) >= max_sections:
+            break
+        if any(not (c[2] + min_gap <= p[1] or c[1] >= p[2] + min_gap) for p in picked):
+            continue
+        picked.append(c)
+    picked.sort(key=lambda c: c[1])
+
+    sections: List[AudioSectionCue] = []
+    for cue_type, a, b, seg_e, _score in picked:
+        start_t = round(float(grid_times[a]), 2)
+        end_t = round(float(grid_times[min(n - 1, b - 1)]) + step, 2)
+        cap = 3.0 if cue_type == "pause" else 4.0
+        end_t = min(end_t, round(start_t + cap, 2))
+        sections.append(
+            AudioSectionCue(
+                cue_type=cue_type,
+                start_sec=start_t,
+                end_sec=end_t,
+                duration_sec=round(end_t - start_t, 2),
+                intensity=round(seg_e, 3),
+                description=(
+                    "Musical pause / breath ideal for still photo highlight with Ken Burns"
+                    if cue_type == "pause"
+                    else "Sustained harmonic note ideal for expressive photo + slow zoom"
+                ),
+            )
+        )
+    return sections
 
 
 def analyze_audio_file(
@@ -28,6 +131,7 @@ def analyze_audio_file(
     if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {filepath}")
 
+    progress.update(5, f"Decoding audio “{path.name}”", service="Librosa audio loader (22.05 kHz mono)")
     try:
         y, sr = librosa.load(str(path), sr=22050, mono=True)
     except Exception:
@@ -35,6 +139,7 @@ def analyze_audio_file(
         import subprocess
         import imageio_ffmpeg
 
+        progress.update(8, f"Converting “{path.name}” to WAV", service="FFmpeg (imageio-ffmpeg)")
         wav_fallback = path.with_suffix(".converted.wav")
         ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
         subprocess.run(
@@ -58,6 +163,7 @@ def analyze_audio_file(
     duration_sec = round(float(librosa.get_duration(y=y, sr=sr)), 3)
 
     # 1. Beat tracking & onset envelope
+    progress.update(25, "Tracking tempo & beats", service="Librosa beat tracker (onset strength)")
     hop_length = 512
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
     tempo, beat_frames = librosa.beat.beat_track(
@@ -82,10 +188,12 @@ def analyze_audio_file(
         beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=hop_length)
 
     # 2. Downbeat detection (4-beat measure phase alignment using low-frequency bass + onset energy)
+    progress.update(50, "Separating harmonic vs. percussive layers", service="Librosa HPSS")
     y_harm, y_perc = librosa.effects.hpss(y)
     rms_all = librosa.feature.rms(y=y, hop_length=hop_length)[0]
     rms_harm = librosa.feature.rms(y=y_harm, hop_length=hop_length)[0]
     rms_perc = librosa.feature.rms(y=y_perc, hop_length=hop_length)[0]
+    progress.update(70, "Locating measure downbeats", service="Librosa onset + percussive RMS phase scoring")
 
     # Evaluate which phase (0, 1, 2, 3) mod 4 has the strongest combined percussive + onset accent
     downbeat_times: List[float] = []
@@ -128,95 +236,36 @@ def analyze_audio_file(
     harm_ratio = harm_interp / (harm_interp + perc_interp + 1e-5)
     harmonic_ratio_envelope = [round(float(v), 3) for v in harm_ratio]
 
-    # 5. Detect Sustained Notes & Musical Pauses/Breaths
-    sections: List[AudioSectionCue] = []
-    n_steps = len(grid_times)
-    median_e = float(np.median(energy_envelope)) if energy_envelope else 0.5
-
-    # Scan with a sliding window for (a) Musical Pauses (low energy dip >= 0.8s)
-    # and (b) Sustained Notes (high harmonic ratio >= 0.65 & moderate energy >= 1.1s)
-    i = 5  # skip very start
-    while i < n_steps - 10:
-        # Check for pause/breath dip
-        window_e = energy_envelope[i : i + 10]
-        window_h = harmonic_ratio_envelope[i : i + 12]
-        mean_e = float(np.mean(window_e))
-        mean_h = float(np.mean(window_h))
-
-        if mean_e < max(0.24, median_e * 0.58):
-            # Extend pause window
-            end_i = i + 10
-            while end_i < n_steps - 3 and energy_envelope[end_i] < max(0.28, median_e * 0.65):
-                end_i += 1
-            start_t = round(float(grid_times[i]), 2)
-            end_t = round(float(grid_times[min(n_steps - 1, end_i)]), 2)
-            dur = round(end_t - start_t, 2)
-            if dur >= 0.8:
-                sections.append(
-                    AudioSectionCue(
-                        cue_type="pause",
-                        start_sec=start_t,
-                        end_sec=min(end_t, round(start_t + 2.6, 2)),
-                        duration_sec=min(dur, 2.6),
-                        intensity=round(mean_e, 3),
-                        description="Musical pause / breath ideal for still photo highlight with Ken Burns",
-                    )
-                )
-                i = end_i + 8
-                continue
-
-        # Check for sustained harmonic note
-        if mean_h > 0.66 and mean_e >= 0.22:
-            end_i = i + 12
-            while (
-                end_i < n_steps - 3
-                and harmonic_ratio_envelope[end_i] > 0.62
-                and end_i - i < 28
-            ):
-                end_i += 1
-            start_t = round(float(grid_times[i]), 2)
-            end_t = round(float(grid_times[min(n_steps - 1, end_i)]), 2)
-            dur = round(end_t - start_t, 2)
-            if dur >= 1.1:
-                sections.append(
-                    AudioSectionCue(
-                        cue_type="sustained_note",
-                        start_sec=start_t,
-                        end_sec=end_t,
-                        duration_sec=dur,
-                        intensity=round(mean_e, 3),
-                        description="Sustained harmonic note ideal for expressive photo + slow zoom",
-                    )
-                )
-                i = end_i + 10
-                continue
-
-        i += 3
+    # 5. Detect Sustained Notes & Musical Pauses/Breaths (track-relative, on smoothed envelopes)
+    progress.update(80, "Detecting sustained notes & musical pauses", service="Librosa RMS / HPSS segmentation")
+    sections = _detect_photo_sections(
+        grid_times=grid_times,
+        energy=np.asarray(energy_envelope, dtype=np.float64),
+        perc=perc_interp,
+        harm_ratio=harm_ratio,
+        duration_sec=duration_sec,
+    )
 
     # Guarantee at least two photo-friendly sustained/pause windows if track was uniformly dense
     if len(sections) < 2 and duration_sec >= 10.0:
-        t1 = round(duration_sec * 0.28, 2)
-        t2 = round(duration_sec * 0.68, 2)
-        sections.append(
-            AudioSectionCue(
-                cue_type="sustained_note",
-                start_sec=t1,
-                end_sec=round(t1 + 1.8, 2),
-                duration_sec=1.8,
-                intensity=0.45,
-                description="Sustained melodic phrase for photo feature",
+        taken = [(s.start_sec, s.end_sec) for s in sections]
+        for frac, cue, desc, dur in [
+            (0.30, "sustained_note", "Sustained melodic phrase for photo feature", 1.8),
+            (0.68, "pause", "Pre-finale breath before final downbeat drop", 1.7),
+        ]:
+            t0 = round(duration_sec * frac, 2)
+            if any(a - 0.5 <= t0 <= b + 0.5 for a, b in taken):
+                continue
+            sections.append(
+                AudioSectionCue(
+                    cue_type=cue,
+                    start_sec=t0,
+                    end_sec=round(t0 + dur, 2),
+                    duration_sec=dur,
+                    intensity=0.4,
+                    description=desc,
+                )
             )
-        )
-        sections.append(
-            AudioSectionCue(
-                cue_type="pause",
-                start_sec=t2,
-                end_sec=round(t2 + 1.7, 2),
-                duration_sec=1.7,
-                intensity=0.30,
-                description="Pre-finale breath before final downbeat drop",
-            )
-        )
         sections.sort(key=lambda s: s.start_sec)
 
     return AudioCueMap(

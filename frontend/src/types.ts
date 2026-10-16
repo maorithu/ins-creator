@@ -114,7 +114,10 @@ export interface TimelineClip {
 export interface InstagramPostCopy {
   hook_title_overlay: string;
   ending_call_to_action: string;
-  video_title_style?: 'minimal_lower_third' | 'cinema_subtitle' | 'frosted_pill' | 'none' | string;
+  video_title_style?: string;
+  hook_text_animation?: string;
+  hook_text_position?: string;
+  hook_duration_sec?: number;
   post_headline: string;
   caption_primary: string;
   caption_alternatives: { label: string; text: string }[];

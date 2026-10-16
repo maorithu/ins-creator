@@ -33,7 +33,7 @@ class Settings:
 
     def __init__(self) -> None:
         self.gemini_api_key: Optional[str] = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         self.google_client_id: Optional[str] = os.getenv("GOOGLE_CLIENT_ID")
         self.google_client_secret: Optional[str] = os.getenv("GOOGLE_CLIENT_SECRET")
         self.google_photos_access_token: Optional[str] = os.getenv("GOOGLE_PHOTOS_ACCESS_TOKEN")

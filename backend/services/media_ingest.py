@@ -13,12 +13,32 @@ from backend.services.dance_analyzer import (
     analyze_video_dance_kinematics,
 )
 from backend.services.sample_generator import ensure_sample_dance_dataset
+from backend.services import progress
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi"}
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 _ANALYZED_MEDIA_CACHE: Dict[str, MediaItem] = {}
+
+
+def analysis_service_label(is_video: bool) -> str:
+    """Human-readable description of which engines analyze a media item."""
+    if is_video:
+        return "OpenCV motion kinematics (jump & turn peaks) + EXIF"
+    label = "Pillow EXIF + OpenCV sharpness & focal-point detection"
+    if settings.gemini_api_key and len(settings.gemini_api_key.strip()) >= 20:
+        label += f" + Gemini Vision ({settings.gemini_model})"
+    return label
+
+
+def _report_item(idx: int, total: int, verb: str, filename: str, is_video: bool, service: Optional[str] = None, half: float = 0.0) -> None:
+    kind = "video" if is_video else "photo"
+    progress.update(
+        100.0 * (idx + half) / max(1, total),
+        f"{verb} {kind} {idx + 1}/{total}: {filename}",
+        service=service or analysis_service_label(is_video),
+    )
 
 
 def _infer_event_category_from_text(text: str) -> EventCategory:
@@ -178,6 +198,7 @@ class GooglePhotosClient:
 
         active_session_id = picker_session_id or settings.last_picker_session_id
         raw_items: List[Dict[str, object]] = []
+        progress.update(2, "Fetching the list of items you picked", service="Google Photos Picker API")
 
         try:
             if active_session_id:
@@ -222,7 +243,9 @@ class GooglePhotosClient:
                 gp_manifest = {}
 
         ingested: List[MediaItem] = []
-        for entry in raw_items[:max_items]:
+        batch = raw_items[:max_items]
+        total = len(batch)
+        for idx, entry in enumerate(batch):
             if not isinstance(entry, dict):
                 continue
             media_file = entry.get("mediaFile", entry)
@@ -255,6 +278,7 @@ class GooglePhotosClient:
             local_path = MEDIA_CACHE_DIR / f"gp_{item_id[:16]}{ext}"
 
             if not local_path.exists() or local_path.stat().st_size < 500:
+                _report_item(idx, total, "Downloading", filename, is_video, service="Google Photos Picker API (media download)")
                 try:
                     # Try authenticated download first (required by Picker API baseUrls), then unauthenticated fallback
                     dl = httpx.get(
@@ -291,6 +315,7 @@ class GooglePhotosClient:
                     source="google_photos",
                     creation_time=gp_manifest[cache_id]["createTime"] or None,
                 )
+                _report_item(idx, total, "Analyzing", filename, is_video, half=0.5)
                 if is_video:
                     media_obj = analyze_video_dance_kinematics(media_obj)
                 else:
@@ -321,9 +346,12 @@ def list_imported_google_photos() -> List[MediaItem]:
             gp_manifest = {}
 
     results: List[MediaItem] = []
-    for fpath in sorted(MEDIA_CACHE_DIR.glob("gp_*"), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not fpath.is_file() or fpath.suffix.lower() == ".json" or fpath.stat().st_size < 500:
-            continue
+    gp_files = [
+        f
+        for f in sorted(MEDIA_CACHE_DIR.glob("gp_*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if f.is_file() and f.suffix.lower() != ".json" and f.stat().st_size >= 500
+    ]
+    for idx, fpath in enumerate(gp_files):
         cache_id = fpath.stem
         meta = gp_manifest.get(cache_id, {})
         orig_filename = meta.get("filename") or fpath.name
@@ -343,6 +371,7 @@ def list_imported_google_photos() -> List[MediaItem]:
                 source="google_photos",
                 creation_time=orig_create_time,
             )
+            _report_item(idx, len(gp_files), "Analyzing", orig_filename, is_video)
             if is_video:
                 item = analyze_video_dance_kinematics(item)
             else:
@@ -357,7 +386,7 @@ def load_and_analyze_sample_dataset(query: str = "") -> List[MediaItem]:
     manifest = ensure_sample_dance_dataset()
     items: List[MediaItem] = []
 
-    for spec in manifest:
+    for idx, spec in enumerate(manifest):
         item_id = str(spec["id"])
         if item_id not in _ANALYZED_MEDIA_CACHE:
             filename = str(spec["filename"])
@@ -374,6 +403,7 @@ def load_and_analyze_sample_dataset(query: str = "") -> List[MediaItem]:
                 semantic_caption=str(spec["semantic_caption"]),
                 source="sample",
             )
+            _report_item(idx, len(manifest), "Analyzing demo", filename, mtype == MediaType.VIDEO)
             if mtype == MediaType.VIDEO:
                 item = analyze_video_dance_kinematics(item)
             else:
@@ -399,7 +429,8 @@ def scan_local_directory(folder_path: str, query: str = "") -> List[MediaItem]:
             found_files.append(p)
 
     results: List[MediaItem] = []
-    for fpath in found_files[:24]:
+    batch_files = found_files[:24]
+    for idx, fpath in enumerate(batch_files):
         cache_key = f"local_{hashlib.md5(str(fpath).encode()).hexdigest()[:10]}"
         if cache_key not in _ANALYZED_MEDIA_CACHE:
             ext = fpath.suffix.lower()
@@ -427,6 +458,7 @@ def scan_local_directory(folder_path: str, query: str = "") -> List[MediaItem]:
                 semantic_caption=f"Dance media item {fpath.stem.replace('_', ' ')}",
                 source="upload" if fpath.parent == UPLOADS_DIR else "local",
             )
+            _report_item(idx, len(batch_files), "Analyzing", fpath.name, is_video)
             if is_video:
                 item = analyze_video_dance_kinematics(item)
             else:
@@ -459,13 +491,16 @@ def search_and_ingest_media(
     if media_source in ("google_photos", "auto"):
         gp_client = GooglePhotosClient(access_token=google_access_token)
         if gp_client.is_configured:
-            gp_items = gp_client.fetch_media_by_query_or_session(
-                query=query, picker_session_id=google_photos_session_id
-            )
+            with progress.scope(0, 50):
+                gp_items = gp_client.fetch_media_by_query_or_session(
+                    query=query, picker_session_id=google_photos_session_id
+                )
             candidates.extend(gp_items)
         # Also include any already-imported Google Photos items cached on disk
         existing_gp_ids = {c.id for c in candidates}
-        for cached_gp in list_imported_google_photos():
+        with progress.scope(50, 70):
+            cached_gp_items = list_imported_google_photos()
+        for cached_gp in cached_gp_items:
             if cached_gp.id not in existing_gp_ids:
                 candidates.append(cached_gp)
 
@@ -473,7 +508,8 @@ def search_and_ingest_media(
         candidates.extend(scan_local_directory(local_folder_path, query=query))
 
     # Always include any files uploaded via the web studio
-    uploaded_items = scan_local_directory(str(UPLOADS_DIR), query=query)
+    with progress.scope(70, 90):
+        uploaded_items = scan_local_directory(str(UPLOADS_DIR), query=query)
     existing_ids = {c.id for c in candidates}
     for u in uploaded_items:
         if u.id not in existing_ids:
@@ -482,7 +518,8 @@ def search_and_ingest_media(
 
     # Only include sample dataset when explicitly requested or when no user media has been imported/uploaded yet
     if media_source == "sample" or (media_source == "auto" and len(candidates) == 0):
-        sample_items = load_and_analyze_sample_dataset(query=query)
+        with progress.scope(90, 100):
+            sample_items = load_and_analyze_sample_dataset(query=query)
         for s in sample_items:
             if s.id not in existing_ids:
                 candidates.append(s)

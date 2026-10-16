@@ -226,3 +226,72 @@ def test_video_trim_photo_transition_styles_and_editorial_title() -> None:
     assert mp4_path.exists()
     assert mp4_path.stat().st_size > 10_000
 
+
+
+def test_builtin_tracks_have_distinct_detected_cues() -> None:
+    """Each built-in track's pause/sustained windows must be found where they were synthesized."""
+    from backend.services.music_generator import BUILT_IN_TRACK_SPECS
+
+    tracks = {t["track_id"]: t for t in client.get("/api/music/tracks").json()}
+    signatures = set()
+    for spec in BUILT_IN_TRACK_SPECS:
+        cue = tracks[spec["track_id"]]
+        kinds = {s["cue_type"]: s for s in cue["sections"]}
+        assert "pause" in kinds and "sustained_note" in kinds
+        p0, p1 = spec["pause_window"]
+        s0, s1 = spec["sustained_window"]
+        assert abs(kinds["pause"]["start_sec"] - p0) < 0.8
+        assert abs(kinds["sustained_note"]["start_sec"] - s0) < 0.8
+        assert len(cue["sections"]) <= 4  # no longer blanket-marks the whole track
+        signatures.add(tuple((s["cue_type"], s["start_sec"]) for s in cue["sections"]))
+    assert len(signatures) == len(BUILT_IN_TRACK_SPECS)
+
+
+def test_unknown_music_track_is_rejected_not_silently_swapped() -> None:
+    r = client.post(
+        "/api/sessions/generate",
+        json={"media_source": "sample", "music_track_id": "custom_doesnotexist", "auto_render_mp4": False, "auto_export_capcut": False},
+    )
+    assert r.status_code == 404
+    assert "no longer available" in r.json()["detail"]
+
+
+def test_progress_tracking_and_hook_preview() -> None:
+    task_id = "test_task_progress_1"
+    r = client.post(
+        "/api/sessions/generate",
+        headers={"X-Task-Id": task_id},
+        json={"media_source": "sample", "target_duration_sec": 8.0, "auto_render_mp4": True, "auto_export_capcut": False},
+    )
+    assert r.status_code == 200
+    prog = client.get(f"/api/progress/{task_id}").json()
+    assert prog["status"] == "done"
+    assert prog["percent"] == 100.0
+    stages = " ".join(e["stage"] for e in prog["log"])
+    assert "Rendering clip" in stages
+    assert any(e["service"] for e in prog["log"])
+
+    styles = client.get("/api/hook-styles").json()["styles"]
+    assert len(styles) >= 10
+    session_id = r.json()["session_id"]
+    for st in styles:
+        img = client.get(
+            "/api/preview/hook-frame",
+            params={"text": "Lillian's Flight 莉莲", "style": st["id"], "session_id": session_id, "width": 180},
+        )
+        assert img.status_code == 200
+        assert img.headers["content-type"] == "image/jpeg"
+        assert len(img.content) > 2000
+
+    # Regenerating the post copy keeps the chosen on-screen text style
+    post_copy = r.json()["post_copy"]
+    post_copy.update({"video_title_style": "neon_glow", "hook_text_animation": "typewriter", "hook_text_position": "top", "hook_duration_sec": 3.4})
+    upd = client.put(
+        f"/api/sessions/{session_id}/timeline",
+        json={"timeline_clips": r.json()["timeline_clips"], "post_copy": post_copy, "re_render_mp4": True},
+    )
+    assert upd.status_code == 200
+    regen = client.post(f"/api/sessions/{session_id}/post-copy", json={"custom_prompt": "short"}).json()
+    assert regen["post_copy"]["video_title_style"] == "neon_glow"
+    assert regen["post_copy"]["hook_text_animation"] == "typewriter"
+    assert regen["post_copy"]["hook_duration_sec"] == 3.4

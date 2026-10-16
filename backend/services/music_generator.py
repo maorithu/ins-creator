@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -11,6 +12,7 @@ import httpx
 from backend.config import MUSIC_DIR, settings
 from backend.models.schemas import AudioCueMap
 from backend.services.audio_analyzer import analyze_audio_file
+from backend.services import progress
 
 
 BUILT_IN_TRACK_SPECS: List[Dict[str, object]] = [
@@ -168,16 +170,47 @@ def _synthesize_dance_track_wav(
 
 
 _CACHED_CUE_MAPS: Dict[str, AudioCueMap] = {}
+_CUSTOM_REGISTRY_PATH = MUSIC_DIR / "custom_tracks.json"
+_REGISTRY_LOADED = False
+
+
+def _load_custom_registry() -> None:
+    global _REGISTRY_LOADED
+    if _REGISTRY_LOADED:
+        return
+    _REGISTRY_LOADED = True
+    if not _CUSTOM_REGISTRY_PATH.exists():
+        return
+    try:
+        raw = json.loads(_CUSTOM_REGISTRY_PATH.read_text(encoding="utf-8"))
+        for entry in raw:
+            cue = AudioCueMap(**entry)
+            if Path(cue.filepath).exists():
+                _CACHED_CUE_MAPS.setdefault(cue.track_id, cue)
+    except Exception:
+        pass
+
+
+def _save_custom_registry() -> None:
+    builtin_ids = {str(s["track_id"]) for s in BUILT_IN_TRACK_SPECS}
+    customs = [c.model_dump() for tid, c in _CACHED_CUE_MAPS.items() if tid not in builtin_ids]
+    try:
+        _CUSTOM_REGISTRY_PATH.write_text(json.dumps(customs), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def register_custom_music_track(cue_map: AudioCueMap) -> AudioCueMap:
-    """Registers an uploaded or AI-generated track in the runtime catalog."""
+    """Registers an uploaded or AI-generated track in the runtime catalog (persisted to disk)."""
+    _load_custom_registry()
     _CACHED_CUE_MAPS[cue_map.track_id] = cue_map
+    _save_custom_registry()
     return cue_map
 
 
 def ensure_builtin_music_tracks() -> List[AudioCueMap]:
     """Ensures all 4 built-in dance tracks are synthesized and analyzed, plus any custom uploaded/generated tracks."""
+    _load_custom_registry()
     results: List[AudioCueMap] = []
     builtin_ids = set()
     for spec in BUILT_IN_TRACK_SPECS:
@@ -216,7 +249,7 @@ def get_music_track_by_id(track_id: str) -> AudioCueMap:
     ensure_builtin_music_tracks()
     if track_id in _CACHED_CUE_MAPS:
         return _CACHED_CUE_MAPS[track_id]
-    return _CACHED_CUE_MAPS["competition_edm_pop"]
+    raise KeyError(f"Music track '{track_id}' not found")
 
 
 def generate_custom_music_track(
@@ -248,6 +281,7 @@ def generate_custom_music_track(
 
     # Optional ElevenLabs Sound Generation API hook if key is configured
     if settings.ai_music_api_key and not wav_path.exists():
+        progress.update(5, f"Generating soundtrack for “{prompt_clean[:40]}”", service="ElevenLabs Sound Generation API")
         try:
             resp = httpx.post(
                 "https://api.elevenlabs.io/v1/sound-generation",
@@ -261,6 +295,7 @@ def generate_custom_music_track(
             pass
 
     if not wav_path.exists():
+        progress.update(15, f"Synthesizing {int(bpm)} BPM soundtrack with pause & sustained sections", service="Procedural NumPy synthesizer (local)")
         chord_freqs = [
             (261.63, 329.63, 392.00),
             (220.00, 261.63, 329.63),
@@ -279,13 +314,14 @@ def generate_custom_music_track(
             style_hint=prompt_clean,
         )
 
-    cue_map = analyze_audio_file(
-        filepath=str(wav_path),
-        track_id=track_id,
-        title=f"AI Custom Track: {prompt_clean[:38]} ({int(bpm)} BPM)",
-        url=f"/static/music/{wav_path.name}",
-        genre="ai_generated",
-        is_generated=True,
-    )
-    _CACHED_CUE_MAPS[track_id] = cue_map
-    return cue_map
+    progress.update(40, "Analyzing generated track for beats & cues", service="Librosa")
+    with progress.scope(40, 100):
+        cue_map = analyze_audio_file(
+            filepath=str(wav_path),
+            track_id=track_id,
+            title=f"AI Custom Track: {prompt_clean[:38]} ({int(bpm)} BPM)",
+            url=f"/static/music/{wav_path.name}",
+            genre="ai_generated",
+            is_generated=True,
+        )
+    return register_custom_music_track(cue_map)

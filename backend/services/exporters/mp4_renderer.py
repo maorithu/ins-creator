@@ -11,6 +11,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from backend.config import EXPORTS_DIR
+from backend.services import progress
+from backend.services.exporters.title_styles import compose_title_overlay, draw_title_on_frame
 from backend.models.schemas import (
     AudioCueMap,
     InstagramPostCopy,
@@ -390,6 +392,31 @@ def _draw_editorial_video_title(
     frame[:, :] = cv2.cvtColor(np.array(composited), cv2.COLOR_RGB2BGR)
 
 
+def _overlay_titles(
+    frame: np.ndarray, post_copy: Optional[InstagramPostCopy], global_t: float, total_duration: float
+) -> None:
+    """Draws the hook title (first `hook_duration_sec`) and closing CTA (last 2s) with the chosen style."""
+    if not post_copy:
+        return
+    style = post_copy.video_title_style or "bold_center_impact"
+    hook_dur = float(getattr(post_copy, "hook_duration_sec", 2.6) or 2.6)
+    position = getattr(post_copy, "hook_text_position", "auto") or "auto"
+    animation = getattr(post_copy, "hook_text_animation", "auto") or "auto"
+    h, w = frame.shape[:2]
+    if global_t <= hook_dur:
+        ov = compose_title_overlay(
+            w, h, post_copy.hook_title_overlay, style, position, animation, global_t, hook_dur, False
+        )
+        draw_title_on_frame(frame, ov)
+    elif global_t >= total_duration - 2.0 and total_duration - 2.0 > hook_dur:
+        ov = compose_title_overlay(
+            w, h, post_copy.ending_call_to_action, style, "auto",
+            "fade_in" if animation == "typewriter" else animation,
+            global_t - (total_duration - 2.0), 2.0, True,
+        )
+        draw_title_on_frame(frame, ov)
+
+
 def render_session_mp4(
     session_id: str,
     timeline_clips: List[TimelineClip],
@@ -445,11 +472,19 @@ def render_session_mp4(
     )
 
     total_duration = max((c.timeline_end_sec for c in timeline_clips), default=12.0)
-    title_style = post_copy.video_title_style if post_copy else "minimal_lower_third"
     prev_last_frame: Optional[np.ndarray] = None
+    total_frames = max(1, sum(max(1, int(round(c.duration_sec * fps))) for c in timeline_clips))
+    frames_done = 0
 
-    for clip in timeline_clips:
+    for clip_idx, clip in enumerate(timeline_clips):
         clip_frames = max(1, int(round(clip.duration_sec * fps)))
+        progress.update(
+            92.0 * frames_done / total_frames,
+            f"Rendering clip {clip_idx + 1}/{len(timeline_clips)}: {clip.filename}"
+            + (f" ({(clip.photo_effect.value if clip.photo_effect else 'ken_burns').replace('_', ' ')})" if clip.media_type == MediaType.PHOTO else f" [{clip.source_in_sec:.1f}s–{clip.source_out_sec:.1f}s]"),
+            service="OpenCV frame compositor + Pillow typography → FFmpeg libx264",
+        )
+        frames_done += clip_frames
         media_item = media_lookup.get(clip.media_id)
         fpath = Path(media_item.filepath) if media_item else None
 
@@ -477,14 +512,7 @@ def render_session_mp4(
                 )
                 last_rendered = frame.copy()
 
-                if post_copy and global_t <= 2.6:
-                    _draw_editorial_video_title(
-                        frame, post_copy.hook_title_overlay, style=title_style, is_closing=False
-                    )
-                elif post_copy and global_t >= total_duration - 2.0:
-                    _draw_editorial_video_title(
-                        frame, post_copy.ending_call_to_action, style=title_style, is_closing=True
-                    )
+                _overlay_titles(frame, post_copy, global_t, total_duration)
 
                 if proc.stdin:
                     proc.stdin.write(frame.tobytes())
@@ -545,14 +573,7 @@ def render_session_mp4(
                 )
                 last_rendered_vid = frame.copy()
 
-                if post_copy and global_t <= 2.6:
-                    _draw_editorial_video_title(
-                        frame, post_copy.hook_title_overlay, style=title_style, is_closing=False
-                    )
-                elif post_copy and global_t >= total_duration - 2.0:
-                    _draw_editorial_video_title(
-                        frame, post_copy.ending_call_to_action, style=title_style, is_closing=True
-                    )
+                _overlay_titles(frame, post_copy, global_t, total_duration)
 
                 if proc.stdin:
                     proc.stdin.write(frame.tobytes())
@@ -564,6 +585,7 @@ def render_session_mp4(
     proc.wait(timeout=60)
 
     # Mux audio track with video
+    progress.update(94, "Muxing soundtrack & finalizing MP4", service="FFmpeg (AAC 192k + faststart)")
     if audio_cue_map and Path(audio_cue_map.filepath).exists():
         cmd_mux = [
             ffmpeg_exe,

@@ -197,9 +197,12 @@ class InstagramPostCopy(BaseModel):
     hook_title_overlay: str = Field(..., description="Punchy on-screen title hook for first 2.5s of the Reel")
     ending_call_to_action: str = Field(default="Keep shining on stage ✨")
     video_title_style: str = Field(
-        default="minimal_lower_third",
-        description="'minimal_lower_third', 'cinema_subtitle', 'frosted_pill', or 'none'",
+        default="bold_center_impact",
+        description="Hook/closing text style id (see title_styles.HOOK_TEXT_STYLES), or 'none'",
     )
+    hook_text_animation: str = Field(default="auto", description="auto | none | fade_in | pop_in | slide_up | typewriter")
+    hook_text_position: str = Field(default="auto", description="auto | top | center | bottom")
+    hook_duration_sec: float = Field(default=2.6, ge=0.8, le=8.0)
     post_headline: str = Field(..., description="Attractive main title/headline for the Instagram post")
     caption_primary: str = Field(..., description="Full storytelling Instagram caption")
     caption_alternatives: List[Dict[str, str]] = Field(
