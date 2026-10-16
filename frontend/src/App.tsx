@@ -423,14 +423,26 @@ export function App() {
         method: 'POST',
         body: formData,
       });
+      if (!res.ok) {
+        const errText = await res.text();
+        setStatusMessage(`Failed to analyze audio file: ${errText.slice(0, 120)}`);
+        return;
+      }
       const cueMap: AudioCueMap = await res.json();
-      setMusicTracks((prev) => [cueMap, ...prev]);
+      setMusicTracks((prev) => [
+        cueMap,
+        ...prev.filter((t) => t.track_id !== cueMap.track_id),
+      ]);
       setSelectedMusicId(cueMap.track_id);
-      setStatusMessage(`Uploaded "${cueMap.title}" (${cueMap.bpm} BPM).`);
+      setStatusMessage(
+        `Uploaded and selected "${cueMap.title}" (${cueMap.bpm} BPM, ${cueMap.downbeat_times.length} downbeats).`
+      );
     } catch (err) {
       console.error(err);
+      setStatusMessage('Error uploading audio file.');
     } finally {
       setIsGeneratingMusic(false);
+      e.target.value = '';
     }
   }
 
@@ -447,12 +459,20 @@ export function App() {
           target_duration_sec: targetDurationSec,
         }),
       });
+      if (!res.ok) {
+        setStatusMessage('Failed to generate custom music track.');
+        return;
+      }
       const cueMap: AudioCueMap = await res.json();
-      setMusicTracks((prev) => [cueMap, ...prev]);
+      setMusicTracks((prev) => [
+        cueMap,
+        ...prev.filter((t) => t.track_id !== cueMap.track_id),
+      ]);
       setSelectedMusicId(cueMap.track_id);
-      setStatusMessage(`Generated and analyzed "${cueMap.title}" (${cueMap.bpm} BPM).`);
+      setStatusMessage(`Generated and selected "${cueMap.title}" (${cueMap.bpm} BPM).`);
     } catch (err) {
       console.error(err);
+      setStatusMessage('Error generating custom music track.');
     } finally {
       setIsGeneratingMusic(false);
     }
@@ -573,10 +593,15 @@ export function App() {
     setStatusMessage('Credentials saved.');
   }
 
-  const activeCueMap =
-    session?.audio_cue_map ||
+  const selectedMusicTrack =
     musicTracks.find((t) => t.track_id === selectedMusicId) ||
+    session?.audio_cue_map ||
     musicTracks[0];
+
+  const activeCueMap =
+    currentStep === 4 && session?.audio_cue_map
+      ? session.audio_cue_map
+      : selectedMusicTrack;
 
   const activePreset = presets.find((p) => p.id === selectedPresetId) || presets[0];
 
@@ -1296,10 +1321,25 @@ export function App() {
                   {activeCueMap && (
                     <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-4">
                       <div>
-                        <div className="text-xs font-semibold text-slate-900 mb-2">
-                          {activeCueMap.title}
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <div className="text-xs font-semibold text-slate-900">
+                            {activeCueMap.title}
+                          </div>
+                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-slate-900 text-white shrink-0">
+                            {activeCueMap.bpm} BPM • {activeCueMap.duration_sec.toFixed(1)}s
+                          </span>
                         </div>
-                        <audio controls src={activeCueMap.url} className="w-full h-9" />
+                        <div className="text-[11px] text-slate-500 mb-2">
+                          Genre: <span className="font-medium text-slate-700">{activeCueMap.genre}</span> •{' '}
+                          {activeCueMap.downbeat_times.length} measure downbeats •{' '}
+                          {activeCueMap.beat_times.length} total beats
+                        </div>
+                        <audio
+                          key={activeCueMap.track_id}
+                          controls
+                          src={activeCueMap.url}
+                          className="w-full h-9"
+                        />
                       </div>
 
                       {/* Clean Beat & Section Cue Map */}
@@ -1310,8 +1350,9 @@ export function App() {
                         </div>
                         <div className="relative h-20 rounded-lg bg-white border border-slate-200 p-2 overflow-hidden flex flex-col justify-end">
                           {activeCueMap.sections.map((sec, idx) => {
-                            const leftPct = Math.min(95, (sec.start_sec / targetDurationSec) * 100);
-                            const widthPct = Math.max(5, (sec.duration_sec / targetDurationSec) * 100);
+                            const previewSpan = Math.max(targetDurationSec, activeCueMap.duration_sec, 10);
+                            const leftPct = Math.min(95, (sec.start_sec / previewSpan) * 100);
+                            const widthPct = Math.max(5, (sec.duration_sec / previewSpan) * 100);
                             if (leftPct >= 100) return null;
                             return (
                               <div
@@ -1327,7 +1368,8 @@ export function App() {
                           })}
 
                           {activeCueMap.downbeat_times.map((db, idx) => {
-                            const leftPct = (db / targetDurationSec) * 100;
+                            const previewSpan = Math.max(targetDurationSec, activeCueMap.duration_sec, 10);
+                            const leftPct = (db / previewSpan) * 100;
                             if (leftPct > 100) return null;
                             return (
                               <div
@@ -1341,7 +1383,7 @@ export function App() {
 
                           <div className="flex items-end gap-[2px] h-10 w-full z-0">
                             {activeCueMap.energy_envelope
-                              .slice(0, Math.round(targetDurationSec * 10))
+                              .slice(0, 240)
                               .map((val, idx) => (
                                 <div
                                   key={idx}
@@ -1350,6 +1392,22 @@ export function App() {
                                 />
                               ))}
                           </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5 text-xs text-slate-600">
+                        <div className="font-semibold text-slate-800">
+                          Measure Downbeats (Jump / Turn Sync Points):
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {activeCueMap.downbeat_times.slice(0, 10).map((db, idx) => (
+                            <span
+                              key={idx}
+                              className="px-1.5 py-0.5 rounded bg-white border border-slate-200 font-mono text-[10px] text-slate-700"
+                            >
+                              {db.toFixed(2)}s
+                            </span>
+                          ))}
                         </div>
                       </div>
 

@@ -28,7 +28,33 @@ def analyze_audio_file(
     if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {filepath}")
 
-    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    try:
+        y, sr = librosa.load(str(path), sr=22050, mono=True)
+    except Exception:
+        # Use bundled imageio_ffmpeg binary to convert .m4a / .mp3 / .aac / video audio to wav
+        import subprocess
+        import imageio_ffmpeg
+
+        wav_fallback = path.with_suffix(".converted.wav")
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                str(path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "22050",
+                str(wav_fallback),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        y, sr = librosa.load(str(wav_fallback), sr=22050, mono=True)
     duration_sec = round(float(librosa.get_duration(y=y, sr=sr)), 3)
 
     # 1. Beat tracking & onset envelope

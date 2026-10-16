@@ -46,6 +46,7 @@ from backend.services.music_generator import (
     ensure_builtin_music_tracks,
     generate_custom_music_track,
     get_music_track_by_id,
+    register_custom_music_track,
 )
 from backend.services.style_presets import (
     apply_supplemental_directions_to_preset,
@@ -289,7 +290,7 @@ async def upload_custom_music(file: UploadFile = File(...)) -> AudioCueMap:
         genre="custom_upload",
         is_generated=False,
     )
-    return cue_map
+    return register_custom_music_track(cue_map)
 
 
 @app.get("/api/media/search", response_model=List[MediaItem])

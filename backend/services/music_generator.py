@@ -170,11 +170,19 @@ def _synthesize_dance_track_wav(
 _CACHED_CUE_MAPS: Dict[str, AudioCueMap] = {}
 
 
+def register_custom_music_track(cue_map: AudioCueMap) -> AudioCueMap:
+    """Registers an uploaded or AI-generated track in the runtime catalog."""
+    _CACHED_CUE_MAPS[cue_map.track_id] = cue_map
+    return cue_map
+
+
 def ensure_builtin_music_tracks() -> List[AudioCueMap]:
-    """Ensures all 4 built-in dance tracks are synthesized and analyzed."""
+    """Ensures all 4 built-in dance tracks are synthesized and analyzed, plus any custom uploaded/generated tracks."""
     results: List[AudioCueMap] = []
+    builtin_ids = set()
     for spec in BUILT_IN_TRACK_SPECS:
         track_id = str(spec["track_id"])
+        builtin_ids.add(track_id)
         wav_path = MUSIC_DIR / f"{track_id}.wav"
         if not wav_path.exists():
             _synthesize_dance_track_wav(
@@ -196,7 +204,12 @@ def ensure_builtin_music_tracks() -> List[AudioCueMap]:
             )
             _CACHED_CUE_MAPS[track_id] = cue_map
         results.append(_CACHED_CUE_MAPS[track_id])
-    return results
+
+    # Prepend any custom uploaded or AI-generated tracks so they appear at the top of the list
+    custom_tracks = [
+        cue for tid, cue in _CACHED_CUE_MAPS.items() if tid not in builtin_ids
+    ]
+    return list(reversed(custom_tracks)) + results
 
 
 def get_music_track_by_id(track_id: str) -> AudioCueMap:
