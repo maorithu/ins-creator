@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 BACKEND_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 MEDIA_CACHE_DIR = DATA_DIR / "media_cache"
